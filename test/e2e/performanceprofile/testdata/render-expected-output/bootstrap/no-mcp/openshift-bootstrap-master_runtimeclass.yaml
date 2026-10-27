@@ -1,0 +1,10 @@
+apiVersion: node.k8s.io/v1
+handler: high-performance
+kind: RuntimeClass
+metadata:
+  labels:
+    performance.openshift.io/weak-owner-reference-name: openshift-bootstrap-master
+  name: performance-openshift-bootstrap-master
+scheduling:
+  nodeSelector:
+    node-role.kubernetes.io/master: ""

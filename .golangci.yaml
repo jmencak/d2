@@ -1,0 +1,76 @@
+version: "2"
+run:
+  modules-download-mode: vendor
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - nolintlint
+    - nosprintfhostport
+    - staticcheck
+    - unconvert
+    - unused
+    - wastedassign
+    - whitespace
+  settings:
+    # report about assignment of errors to blank identifier: `num, _ := strconv.Atoi(numStr)`;
+    # default is false: such cases aren't reported by default.
+    errcheck:
+      check-blank: false
+    # Do not set locale explicitly, the default is to use a neutral variety of English.
+    # Setting locale to US will cause correcting the British spelling of 'colour' to 'color'.
+    # locale: US
+    misspell:
+      ignore-rules:
+        - NTO
+        - nto
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Technical debt, GetEventRecorderFor() this uses the old events API and will be removed in a future release.
+      - linters:
+          - staticcheck
+        text: "SA1019:.*GetEventRecorderFor is deprecated"
+      # Technical debt, ReportViaDeprecatedReporter() will be removed in future ginkgo versions.
+      - linters:
+          - staticcheck
+        text: "SA1019: reporters.ReportViaDeprecatedReporter is deprecated"
+      # Dot imports shouldn't be used, unfortunately they are.
+      - linters:
+          - staticcheck
+        text: 'ST1001: should not use dot imports'
+      # sttrings.Replace(..., -1) is being used by pkg/manifests/bindata.go
+      - linters:
+          - staticcheck
+        text: 'QF1004: could use strings.ReplaceAll instead'
+      # Sometimes there's a valid reason for capitalization, such as k8s resource names.
+      - linters:
+          - staticcheck
+        text: 'ST1005: error strings should not be capitalized'
+      - linters:
+          - staticcheck
+        text: 'QF1011: could omit type'
+      - linters:
+          - staticcheck
+        text: 'ST1023: should omit type'
+    paths:
+      - vendor
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

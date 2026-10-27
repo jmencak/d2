@@ -1,0 +1,12 @@
+# Folders
+_output
+_obj
+_test
+tmp
+
+# Files
+/*.sh
+/TODO
+pkg/manifests/bindata.go
+test/extended/bindata/bindata.go
+cover.out

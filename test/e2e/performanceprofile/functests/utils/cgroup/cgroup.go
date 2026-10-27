@@ -1,0 +1,79 @@
+package cgroup
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	apiconfigv1 "github.com/openshift/api/config/v1"
+	cgroupv1 "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/cgroup/v1"
+	cgroupv2 "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/cgroup/v2"
+)
+
+type ControllersGetter interface {
+	// Pod is for getting controller config at the pod level
+	Pod(ctx context.Context, pod *corev1.Pod, controllerConfig interface{}) error
+	// Container is for getting controller config at the container level
+	Container(ctx context.Context, pod *corev1.Pod, containerName string, controllerConfig interface{}) error
+	// Child is for getting controller config at the container's child level
+	Child(ctx context.Context, pod *corev1.Pod, containerName, childName string, controllerConfig interface{}) error
+}
+
+func IsVersion2(ctx context.Context, c client.Client) (bool, error) {
+	nodecfg := &apiconfigv1.Node{}
+	key := client.ObjectKey{
+		Name: "cluster",
+	}
+	err := c.Get(ctx, key, nodecfg)
+	if err != nil {
+		return false, fmt.Errorf("failed to get configs.node object. name=%q; %w", key.Name, err)
+	}
+	// in case `apiconfigv1.CgroupMode` not set, it's returned true since
+	// the platform's default is cgroupV2
+	if nodecfg.Spec.CgroupMode == apiconfigv1.CgroupModeV2 || nodecfg.Spec.CgroupMode == apiconfigv1.CgroupModeEmpty {
+		return true, nil
+	}
+	return false, nil
+}
+
+// BuildGetter return a cgroup information getter that complies with
+// the cgroup version that is currently used by the nodes on the cluster
+func BuildGetter(ctx context.Context, c client.Client, k8sClient *kubernetes.Clientset) (ControllersGetter, error) {
+	isV2, versionErr := IsVersion2(ctx, c)
+	if versionErr != nil {
+		return nil, versionErr
+	}
+	if isV2 {
+		return cgroupv2.NewManager(c, k8sClient), nil
+	} else {
+		return cgroupv1.NewManager(c, k8sClient), nil
+	}
+}
+
+// PidParser parsing /proc/pid/cgroup
+func PidParser(lines []byte) (string, error) {
+	var cgroupPath string
+	for _, line := range bytes.Split(lines, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		fields := bytes.Split(line, []byte(":"))
+		if len(fields) != 3 {
+			return "", fmt.Errorf("error parsing cgroup: expected 3 fields but got %d", len(fields))
+		}
+
+		if bytes.Contains(fields[1], []byte("=")) {
+			continue
+		}
+		path := string(fields[2])
+		if len(path) > len(cgroupPath) {
+			cgroupPath = path
+		}
+	}
+	return strings.TrimSpace(cgroupPath), nil
+}

@@ -1,0 +1,60 @@
+---
+apiVersion: config.openshift.io/v1
+kind: Infrastructure
+metadata:
+  creationTimestamp: "2025-03-13T10:51:25Z"
+  generation: 1
+  managedFields:
+  - apiVersion: config.openshift.io/v1
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:spec:
+        .: {}
+        f:cloudConfig:
+          .: {}
+          f:name: {}
+        f:platformSpec:
+          .: {}
+          f:type: {}
+    manager: cluster-bootstrap
+    operation: Update
+    time: "2025-03-13T10:51:25Z"
+  - apiVersion: config.openshift.io/v1
+    fieldsType: FieldsV1
+    fieldsV1:
+      f:status:
+        .: {}
+        f:apiServerInternalURI: {}
+        f:apiServerURL: {}
+        f:controlPlaneTopology: {}
+        f:cpuPartitioning: {}
+        f:etcdDiscoveryDomain: {}
+        f:infrastructureName: {}
+        f:infrastructureTopology: {}
+        f:platform: {}
+        f:platformStatus:
+          .: {}
+          f:type: {}
+    manager: cluster-bootstrap
+    operation: Update
+    subresource: status
+    time: "2025-03-13T10:51:25Z"
+  name: cluster
+  resourceVersion: "426"
+  uid: c8f612d9-fc81-4aa8-b9d4-ea213042e872
+spec:
+  cloudConfig:
+    name: ""
+  platformSpec:
+    type: None
+status:
+  apiServerInternalURI: https://api-int.sno.myocp4.com:6443
+  apiServerURL: https://api.sno.myocp4.com:6443
+  controlPlaneTopology: SingleReplica
+  cpuPartitioning: None
+  etcdDiscoveryDomain: ""
+  infrastructureName: sno-8jnw5
+  infrastructureTopology: SingleReplica
+  platform: None
+  platformStatus:
+    type: None

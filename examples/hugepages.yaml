@@ -1,0 +1,23 @@
+apiVersion: tuned.openshift.io/v1
+kind: Tuned
+metadata:
+  name: openshift-hugepages
+  namespace: openshift-cluster-node-tuning-operator
+spec:
+  profile:
+  - data: |
+      [main]
+      summary=Configuration for hugepages
+      include=openshift-node
+      [vm]
+      transparent_hugepages=never
+      # Comments that do not start at the beginning of a line as the TuneD
+      # documentation states are currently (2021-09-15) a grey area and likely
+      [sysctl]
+      vm.nr_hugepages=1		# a bad idea as rhbz#2004508 shows.
+    name: openshift-hugepages
+  recommend:
+  - match:
+    - label: tuned.openshift.io/hugepages
+    priority: 20
+    profile: openshift-hugepages

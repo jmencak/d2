@@ -1,0 +1,15 @@
+approvers:
+  - jmencak
+  - MarSik
+  - ffromani
+  - yanirq
+  - Tal-or
+reviewers:
+  - jmencak
+  - MarSik
+  - yanirq
+  - ffromani
+  - Tal-or
+  - swatisehgal
+  - tavital
+component: "Node Tuning Operator"

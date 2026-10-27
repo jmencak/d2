@@ -1,0 +1,2169 @@
+package profilecreator
+
+import (
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"sort"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
+
+	"github.com/jaypipes/ghw/pkg/cpu"
+	"github.com/jaypipes/ghw/pkg/topology"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/profilecreator/toleration"
+)
+
+const (
+	mustGatherDirPath    = "../../../test/e2e/performanceprofile/testdata/must-gather/must-gather.bare-metal"
+	mustGatherSNODirPath = "../../../test/e2e/performanceprofile/testdata/must-gather/must-gather.sno"
+
+	sno     = "sno"
+	worker1 = "worker1.internal"
+	worker2 = "worker2.internal"
+)
+
+var _ = Describe("PerformanceProfileCreator: MCP and Node Matching", func() {
+	var nodes []*v1.Node
+	var mcps []*mcfgv1.MachineConfigPool
+
+	BeforeEach(func() {
+		var err error
+
+		nodes, err = GetNodeList(mustGatherDirPath)
+		Expect(err).ToNot(HaveOccurred())
+		mcps, err = GetMCPList(mustGatherDirPath)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	Context("Identifying Nodes targeted by MCP", func() {
+		It("should find one machine in cnf-worker MCP", func() {
+			mcp, err := GetMCP(mustGatherDirPath, "worker-cnf")
+			Expect(err).ToNot(HaveOccurred())
+
+			matchedNodes, err := GetNodesForPool(mcp, mcps, nodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(matchedNodes).ToNot(BeNil())
+			Expect(len(matchedNodes)).To(Equal(1))
+			Expect(matchedNodes[0].GetName()).To(Equal(worker1))
+		})
+		It("should find 1 machine in worker MCP", func() {
+			mcp, err := GetMCP(mustGatherDirPath, "worker")
+			Expect(err).ToNot(HaveOccurred())
+
+			matchedNodes, err := GetNodesForPool(mcp, mcps, nodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(matchedNodes).ToNot(BeNil())
+			Expect(len(matchedNodes)).To(Equal(1))
+			Expect(matchedNodes[0].GetName()).To(Equal(worker2))
+		})
+	})
+
+	Context("Ensure the correct MCP selector is used", func() {
+		It("should detect the cnf-worker MCP selector", func() {
+			mcp, err := GetMCP(mustGatherDirPath, "worker-cnf")
+			Expect(err).ToNot(HaveOccurred())
+
+			mcpSelector, err := GetMCPSelector(mcp, mcps)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(mcpSelector)).To(Equal(1))
+
+			for key, value := range mcpSelector {
+				Expect(key).To(Equal("machineconfiguration.openshift.io/role"))
+				Expect(value).To(Equal("worker-cnf"))
+				break
+			}
+		})
+
+		It("should detect the worker MCP selector", func() {
+			mcp, err := GetMCP(mustGatherDirPath, "worker")
+			Expect(err).ToNot(HaveOccurred())
+
+			mcpSelector, err := GetMCPSelector(mcp, mcps)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(mcpSelector)).To(Equal(1))
+
+			for key, value := range mcpSelector {
+				Expect(key).To(Equal("pools.operator.machineconfiguration.openshift.io/worker"))
+				Expect(value).To(Equal(""))
+				break
+			}
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: MCP and Node Matching in SNO", func() {
+	var nodes []*v1.Node
+	var mcps []*mcfgv1.MachineConfigPool
+
+	BeforeEach(func() {
+		var err error
+
+		nodes, err = GetNodeList(mustGatherSNODirPath)
+		Expect(err).ToNot(HaveOccurred())
+		mcps, err = GetMCPList(mustGatherSNODirPath)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	Context("Identifying Nodes targeted by MCP in SNO", func() {
+		It("should find no nodes in worker MCP", func() {
+			mcp, err := GetMCP(mustGatherSNODirPath, "worker")
+			Expect(err).ToNot(HaveOccurred())
+
+			matchedNodes, err := GetNodesForPool(mcp, mcps, nodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(matchedNodes)).To(Equal(0))
+		})
+		It("should find 1 machine in master MCP", func() {
+			mcp, err := GetMCP(mustGatherSNODirPath, "master")
+			Expect(err).ToNot(HaveOccurred())
+
+			matchedNodes, err := GetNodesForPool(mcp, mcps, nodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(matchedNodes).ToNot(BeNil())
+			Expect(len(matchedNodes)).To(Equal(1))
+			Expect(matchedNodes[0].GetName()).To(Equal(sno))
+		})
+	})
+
+	Context("Ensure the correct MCP selector is used in SNO", func() {
+		It("should detect the worker MCP selector", func() {
+			mcp, err := GetMCP(mustGatherSNODirPath, "worker")
+			Expect(err).ToNot(HaveOccurred())
+
+			mcpSelector, err := GetMCPSelector(mcp, mcps)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(mcpSelector)).To(Equal(1))
+
+			for key, value := range mcpSelector {
+				Expect(key).To(Equal("pools.operator.machineconfiguration.openshift.io/worker"))
+				Expect(value).To(Equal(""))
+				break
+			}
+		})
+		It("should detect the master MCP selector", func() {
+			mcp, err := GetMCP(mustGatherSNODirPath, "master")
+			Expect(err).ToNot(HaveOccurred())
+
+			mcpSelector, err := GetMCPSelector(mcp, mcps)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(mcpSelector)).To(Equal(1))
+
+			for key, value := range mcpSelector {
+				Expect(key).To(Equal("pools.operator.machineconfiguration.openshift.io/master"))
+				Expect(value).To(Equal(""))
+				break
+			}
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Getting MCP from Must Gather", func() {
+	var mcpName, mcpNodeSelectorKey, mustGatherDirAbsolutePath string
+	var err error
+	Context("Identifying Nodes targeted by MCP", func() {
+		It("gets the MCP successfully", func() {
+			mcpName = "worker-cnf"
+			mcpNodeSelectorKey = "node-role.kubernetes.io/worker-cnf"
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			mcp, err := GetMCP(mustGatherDirAbsolutePath, mcpName)
+			k, _ := components.GetFirstKeyAndValue(mcp.Spec.NodeSelector.MatchLabels)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(k).To(Equal(mcpNodeSelectorKey))
+		})
+		It("fails to get MCP as an MCP with that name doesn't exist", func() {
+			mcpName = "foo"
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			mcp, err := GetMCP(mustGatherDirAbsolutePath, mcpName)
+			Expect(mcp).To(BeNil())
+			Expect(err).To(HaveOccurred())
+		})
+		It("fails to get MCP due to misconfigured must-gather path", func() {
+			mcpName = "worker-cnf"
+			mustGatherDirAbsolutePath, err = filepath.Abs("foo-path")
+			Expect(err).ToNot(HaveOccurred())
+			_, err := GetMCP(mustGatherDirAbsolutePath, mcpName)
+			Expect(err).To(HaveOccurred())
+		})
+
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Getting Nodes from Must Gather", func() {
+	var mustGatherDirAbsolutePath string
+	var err error
+
+	Context("Identifying Nodes in the cluster", func() {
+		It("gets the Nodes successfully", func() {
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			nodes, err := GetNodeList(mustGatherDirAbsolutePath)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(nodes)).To(Equal(3)) // Normally, this should be 5 (3 masters, 2 workers); however, 1 master installation with 2 workers was used.
+		})
+		It("fails to get Nodes due to misconfigured must-gather path", func() {
+			mustGatherDirAbsolutePath, err = filepath.Abs("foo-path")
+			_, err := GetNodeList(mustGatherDirAbsolutePath)
+			Expect(err).To(HaveOccurred())
+		})
+
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Consuming GHW Snapshot from Must Gather", func() {
+	var mustGatherDirAbsolutePath string
+	var node *v1.Node
+	var err error
+
+	Context("Identifying Nodes Info of the nodes cluster", func() {
+		It("gets the Nodes Info successfully", func() {
+			node = newTestNode(worker1)
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err := NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(handle.Cleanup)
+			cpuInfo, err := handle.CPU()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(cpuInfo.Processors)).To(Equal(2))
+			Expect(int(cpuInfo.TotalCores)).To(Equal(40))
+			Expect(int(cpuInfo.TotalThreads)).To(Equal(80))
+			topologyInfo, err := handle.SortedTopology()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(len(topologyInfo.Nodes)).To(Equal(2))
+		})
+		It("fails to get Nodes Info due to misconfigured must-gather path", func() {
+			mustGatherDirAbsolutePath, err = filepath.Abs("foo-path")
+			_, err := NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).To(HaveOccurred())
+		})
+		It("fails to get Nodes Info for a node that does not exist", func() {
+			node = newTestNode("foo")
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			_, err := NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).To(HaveOccurred())
+		})
+
+	})
+})
+
+var _ = Describe("Performance profile creator: test with a simple cpu architecture to see algorithm easely", func() {
+	Context("With 16 cores, 32 Threads, 2 sockets 2 NUMA zones", func() {
+
+		var sysInfo, sysInfoNode1 systemInfo
+
+		BeforeEach(func() {
+			core0 := cpu.ProcessorCore{
+				ID:                0,
+				NumThreads:        2,
+				LogicalProcessors: []int{0, 8},
+			}
+			core1 := cpu.ProcessorCore{
+				ID:                1,
+				NumThreads:        2,
+				LogicalProcessors: []int{1, 9},
+			}
+			core2 := cpu.ProcessorCore{
+				ID:                2,
+				NumThreads:        2,
+				LogicalProcessors: []int{2, 10},
+			}
+			core3 := cpu.ProcessorCore{
+				ID:                3,
+				NumThreads:        2,
+				LogicalProcessors: []int{3, 11},
+			}
+			core4 := cpu.ProcessorCore{
+				ID:                4,
+				NumThreads:        2,
+				LogicalProcessors: []int{4, 12},
+			}
+			core5 := cpu.ProcessorCore{
+				ID:                5,
+				NumThreads:        2,
+				LogicalProcessors: []int{5, 13},
+			}
+			core6 := cpu.ProcessorCore{
+				ID:                6,
+				NumThreads:        2,
+				LogicalProcessors: []int{6, 14},
+			}
+			core7 := cpu.ProcessorCore{
+				ID:                7,
+				NumThreads:        2,
+				LogicalProcessors: []int{7, 15},
+			}
+
+			core8 := cpu.ProcessorCore{
+				ID:                8,
+				NumThreads:        2,
+				LogicalProcessors: []int{16, 24},
+			}
+			core9 := cpu.ProcessorCore{
+				ID:                9,
+				NumThreads:        2,
+				LogicalProcessors: []int{17, 25},
+			}
+			core10 := cpu.ProcessorCore{
+				ID:                10,
+				NumThreads:        2,
+				LogicalProcessors: []int{18, 26},
+			}
+			core11 := cpu.ProcessorCore{
+				ID:                11,
+				NumThreads:        2,
+				LogicalProcessors: []int{19, 27},
+			}
+			core12 := cpu.ProcessorCore{
+				ID:                12,
+				NumThreads:        2,
+				LogicalProcessors: []int{20, 28},
+			}
+			core13 := cpu.ProcessorCore{
+				ID:                13,
+				NumThreads:        2,
+				LogicalProcessors: []int{21, 29},
+			}
+			core14 := cpu.ProcessorCore{
+				ID:                14,
+				NumThreads:        2,
+				LogicalProcessors: []int{22, 30},
+			}
+			core15 := cpu.ProcessorCore{
+				ID:                15,
+				NumThreads:        2,
+				LogicalProcessors: []int{23, 31},
+			}
+
+			topologyInfoNodes := []*topology.Node{
+				{
+					ID: 0,
+					Cores: []*cpu.ProcessorCore{
+						&core0,
+						&core1,
+						&core2,
+						&core3,
+					},
+				},
+				{
+					ID: 1,
+					Cores: []*cpu.ProcessorCore{
+						&core4,
+						&core5,
+						&core6,
+						&core7,
+					},
+				},
+				{
+					ID: 2,
+					Cores: []*cpu.ProcessorCore{
+						&core8,
+						&core9,
+						&core10,
+						&core11,
+					},
+				},
+				{
+					ID: 3,
+					Cores: []*cpu.ProcessorCore{
+						&core12,
+						&core13,
+						&core14,
+						&core15,
+					},
+				},
+			}
+
+			topologyInfo := topology.Info{
+				Architecture: topology.ARCHITECTURE_NUMA,
+				Nodes:        topologyInfoNodes,
+			}
+
+			processors := []*cpu.Processor{
+				{
+					ID:         0,
+					NumCores:   8,
+					NumThreads: 16,
+					Vendor:     "redhat",
+					Model:      "rh-testing",
+					Cores: []*cpu.ProcessorCore{
+						&core0,
+						&core1,
+						&core2,
+						&core3,
+						&core4,
+						&core5,
+						&core6,
+						&core7,
+					},
+				},
+				{
+					ID:         1,
+					NumCores:   8,
+					NumThreads: 16,
+					Vendor:     "redhat",
+					Model:      "rh-testing",
+					Cores: []*cpu.ProcessorCore{
+						&core8,
+						&core9,
+						&core10,
+						&core11,
+						&core12,
+						&core13,
+						&core14,
+						&core15,
+					},
+				},
+			}
+
+			cpuInfo := cpu.Info{
+				TotalCores:   16,
+				TotalThreads: 32,
+				Processors:   processors,
+			}
+
+			extCpuInfo := extendedCPUInfo{
+				CpuInfo:                  &cpuInfo,
+				NumLogicalProcessorsUsed: make(map[int]int),
+				LogicalProcessorsUsed:    make(map[int]struct{}),
+			}
+
+			sysInfo = systemInfo{
+				CpuInfo:      &extCpuInfo,
+				TopologyInfo: &topologyInfo,
+				HtEnabled:    true,
+			}
+
+			// second system with different core IDs
+			core4node1 := cpu.ProcessorCore{
+				ID:                7,
+				NumThreads:        2,
+				LogicalProcessors: []int{4, 12},
+			}
+			core5node1 := cpu.ProcessorCore{
+				ID:                4,
+				NumThreads:        2,
+				LogicalProcessors: []int{5, 13},
+			}
+			core6node1 := cpu.ProcessorCore{
+				ID:                6,
+				NumThreads:        2,
+				LogicalProcessors: []int{6, 14},
+			}
+			core7node1 := cpu.ProcessorCore{
+				ID:                5,
+				NumThreads:        2,
+				LogicalProcessors: []int{7, 15},
+			}
+
+			core8node1 := cpu.ProcessorCore{
+				ID:                0,
+				NumThreads:        2,
+				LogicalProcessors: []int{16, 24},
+			}
+			core9node1 := cpu.ProcessorCore{
+				ID:                1,
+				NumThreads:        2,
+				LogicalProcessors: []int{17, 25},
+			}
+			core10node1 := cpu.ProcessorCore{
+				ID:                2,
+				NumThreads:        2,
+				LogicalProcessors: []int{18, 26},
+			}
+			core11node1 := cpu.ProcessorCore{
+				ID:                3,
+				NumThreads:        2,
+				LogicalProcessors: []int{19, 27},
+			}
+			core12node1 := cpu.ProcessorCore{
+				ID:                5,
+				NumThreads:        2,
+				LogicalProcessors: []int{20, 28},
+			}
+
+			topologyInfoNodesNode1 := []*topology.Node{
+				{
+					ID: 0,
+					Cores: []*cpu.ProcessorCore{
+						&core0,
+						&core1,
+						&core2,
+						&core3,
+					},
+				},
+				{
+					ID: 1,
+					Cores: []*cpu.ProcessorCore{
+						&core4node1,
+						&core5node1,
+						&core6node1,
+						&core7node1,
+					},
+				},
+				{
+					ID: 2,
+					Cores: []*cpu.ProcessorCore{
+						&core8node1,
+						&core9node1,
+						&core10node1,
+						&core11node1,
+					},
+				},
+				{
+					ID: 3,
+					Cores: []*cpu.ProcessorCore{
+						&core12node1,
+						&core13,
+						&core14,
+						&core15,
+					},
+				},
+			}
+
+			topologyInfoNode1 := topology.Info{
+				Architecture: topology.ARCHITECTURE_NUMA,
+				Nodes:        topologyInfoNodesNode1,
+			}
+
+			processorsNode1 := []*cpu.Processor{
+				{
+					ID:         0,
+					NumCores:   8,
+					NumThreads: 16,
+					Vendor:     "redhat",
+					Model:      "rh-testing",
+					Cores: []*cpu.ProcessorCore{
+						&core0,
+						&core1,
+						&core2,
+						&core3,
+						&core4node1,
+						&core5node1,
+						&core6node1,
+						&core7node1,
+					},
+				},
+				{
+					ID:         1,
+					NumCores:   8,
+					NumThreads: 16,
+					Vendor:     "redhat",
+					Model:      "rh-testing",
+					Cores: []*cpu.ProcessorCore{
+						&core8node1,
+						&core9node1,
+						&core10node1,
+						&core11node1,
+						&core12node1,
+						&core13,
+						&core14,
+						&core15,
+					},
+				},
+			}
+
+			cpuInfoNode1 := cpu.Info{
+				TotalCores:   16,
+				TotalThreads: 32,
+				Processors:   processorsNode1,
+			}
+
+			extCpuInfoNode1 := extendedCPUInfo{
+				CpuInfo:                  &cpuInfoNode1,
+				NumLogicalProcessorsUsed: make(map[int]int),
+				LogicalProcessorsUsed:    make(map[int]struct{}),
+			}
+
+			sysInfoNode1 = systemInfo{
+				CpuInfo:      &extCpuInfoNode1,
+				TopologyInfo: &topologyInfoNode1,
+				HtEnabled:    true,
+			}
+		})
+
+		It("diag0002 can offline a full socket", func() {
+			reservedCPUCount := 8
+			offlinedCPUCount := 16
+			splitReservedCPUsAcrossNUMA := false
+			disableHT := false
+			highPowerConsumptionMode := false
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			// ensure that siblings of the CPUs in each category belong to the same category (reserved/offlined/isolated)
+			reservedSiblings := getSiblingsListForCPUSet(sysInfo, reserved)
+			isolatedSiblings := getSiblingsListForCPUSet(sysInfo, isolated)
+			offlinedSiblings := getSiblingsListForCPUSet(sysInfo, offlined)
+			Expect(reservedSiblings).To(Equal(reserved))
+			Expect(isolatedSiblings).To(Equal(isolated))
+			Expect(offlinedSiblings).To(Equal(offlined))
+
+			Expect(reserved.String()).To(Equal("0-3,8-11"))
+			Expect(isolated.String()).To(Equal("4-7,12-15"))
+			Expect(offlined.String()).To(Equal("16-31"))
+		})
+
+		It("diag0003 cannot offline a full socket because reserved are splitted over all NUMA zones", func() {
+			reservedCPUCount := 8
+			offlinedCPUCount := 16
+			splitReservedCPUsAcrossNUMA := true
+			disableHT := false
+			highPowerConsumptionMode := false
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			reservedSiblings := getSiblingsListForCPUSet(sysInfo, reserved)
+			Expect(reservedSiblings).To(Equal(reserved))
+
+			Expect(reserved.String()).To(Equal("0,4,8,12,16,20,24,28"))
+			Expect(isolated.String()).To(Equal("6-7,17-19,21-23"))
+			Expect(offlined.String()).To(Equal("1-3,5,9-11,13-15,25-27,29-31"))
+		})
+
+		It("diag0004 in high-power-consumption-mode so do not offline a socket, go for sibling threads instead", func() {
+			reservedCPUCount := 8
+			offlinedCPUCount := 16
+			splitReservedCPUsAcrossNUMA := false
+			disableHT := false
+			highPowerConsumptionMode := true
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			reservedSiblings := getSiblingsListForCPUSet(sysInfo, reserved)
+			Expect(reservedSiblings).To(Equal(reserved))
+
+			Expect(reserved.String()).To(Equal("0-3,8-11"))
+			Expect(isolated.String()).To(Equal("16-23"))
+			Expect(offlined.String()).To(Equal("4-7,12-15,24-31"))
+		})
+
+		It("diag0005 as socket is too big to be offlined completely we go for the siblings", func() {
+			reservedCPUCount := 8
+			offlinedCPUCount := 12
+			splitReservedCPUsAcrossNUMA := false
+			disableHT := false
+			highPowerConsumptionMode := false
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			reservedSiblings := getSiblingsListForCPUSet(sysInfo, reserved)
+			Expect(reservedSiblings).To(Equal(reserved))
+
+			Expect(reserved.String()).To(Equal("0-3,8-11"))
+			Expect(isolated.String()).To(Equal("4-7,16-23"))
+			Expect(offlined.String()).To(Equal("12-15,24-31"))
+		})
+
+		It("diag0006 can set offline a complete socket and then goes for the siblings", func() {
+			reservedCPUCount := 8
+			offlinedCPUCount := 19
+			splitReservedCPUsAcrossNUMA := false
+			disableHT := false
+			highPowerConsumptionMode := false
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			reservedSiblings := getSiblingsListForCPUSet(sysInfo, reserved)
+			Expect(reservedSiblings).To(Equal(reserved))
+
+			Expect(reserved.String()).To(Equal("0-3,8-11"))
+			Expect(isolated.String()).To(Equal("4-7,15"))
+			Expect(offlined.String()).To(Equal("12-14,16-31"))
+		})
+
+		It("diag0007 as sibling threads will be disabled by kernel they are not handled in the sets", func() {
+			reservedCPUCount := 4
+			offlinedCPUCount := 8
+			splitReservedCPUsAcrossNUMA := false
+			disableHT := true
+			highPowerConsumptionMode := false
+
+			cpuSets, err := CalculateCPUSets(&sysInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reserved, isolated, offlined := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			klog.Infof("Input:")
+			klog.Infof("\treserved-cpu-count:\t\t%d", reservedCPUCount)
+			klog.Infof("\tofflined-cpu-count:\t\t%d", offlinedCPUCount)
+			klog.Infof("\tdisable-ht:\t\t\t%v", disableHT)
+			klog.Infof("\tsplitReservedCPUsAcrossNUMA:\t%v", splitReservedCPUsAcrossNUMA)
+			klog.Infof("\thighConsumptionMode:\t\t%v", highPowerConsumptionMode)
+			klog.Infof("Output:")
+			klog.Infof("\treserved: %s", reserved.String())
+			klog.Infof("\tisolated: %s", isolated.String())
+			klog.Infof("\tofflined: %s", offlined.String())
+
+			Expect(offlined.Intersection(reserved).IsEmpty()).To(BeTrue())
+			Expect(offlined.Intersection(isolated).IsEmpty()).To(BeTrue())
+			Expect(offlined.Size()).To(Equal(offlinedCPUCount))
+
+			cpuSetsNode1, err := CalculateCPUSets(&sysInfoNode1, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedNode1, isolatedNode1, offlinedNode1 := cpuSetsNode1.Reserved, cpuSetsNode1.Isolated, cpuSetsNode1.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			By("ensure that PPC calculated same sets on another nodes but different core IDs")
+			Expect(reservedNode1).To(Equal(reserved))
+			Expect(isolatedNode1).To(Equal(isolated))
+			Expect(offlinedNode1).To(Equal(offlined))
+
+			Expect(reserved.String()).To(Equal("0-3"))
+			Expect(isolated.String()).To(Equal("4-7"))
+			Expect(offlined.String()).To(Equal("16-23"))
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Populating Reserved and Isolated CPUs in Performance Profile", func() {
+	var mustGatherDirAbsolutePath string
+	var node *v1.Node
+	var handle *GHWHandler
+	var splitReservedCPUsAcrossNUMA, disableHT bool
+	var reservedCPUCount int
+	var offlinedCPUCount int
+	var err error
+
+	BeforeEach(func() {
+		node = newTestNode(worker1)
+	})
+
+	AfterEach(func() {
+		if handle != nil {
+			Expect(handle.Cleanup()).To(Succeed())
+			handle = nil
+		}
+	})
+
+	Context("Check if reserved and isolated CPUs are properly populated in the performance profile", func() {
+		It("Ensure reserved CPUs populated are correctly when splitReservedCPUsAcrossNUMA is disabled and disableHT is disabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			highPowerConsumptionMode := false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+			Expect(isolatedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19-39,41,43,45,47,49,51,53,55,57,59-79"))
+			Expect(offlinedCPUSet.String()).To(BeEmpty())
+
+			// ensure that siblings of the CPUs in each category belong to the same category (reserved/offlined/isolated)
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			isolatedSiblings := getSiblingsListForCPUSet(*systemInfo, isolatedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+			Expect(isolatedSiblings).To(Equal(isolatedCPUSet))
+		})
+		It("Ensure reserved CPUs populated are correctly when splitReservedCPUsAcrossNUMA is enabled and disableHT is disabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0-9,40-49"))
+			Expect(isolatedCPUSet.String()).To(Equal("10-39,50-79"))
+			Expect(offlinedCPUSet.String()).To(BeEmpty())
+
+			// ensure that siblings of the CPUs in each category belong to the same category (reserved/offlined/isolated)
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			isolatedSiblings := getSiblingsListForCPUSet(*systemInfo, isolatedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+			Expect(isolatedSiblings).To(Equal(isolatedCPUSet))
+		})
+		It("Errors out in case negative reservedCPUCount is specified", func() {
+			reservedCPUCount = -2 // random negative number, no special meaning
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Errors out in case specified reservedCPUCount is greater than the total CPUs present in the system and disableHT is disabled", func() {
+			reservedCPUCount = 100 // random positive number greater than that total number of CPUs
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Errors out in case hyperthreading is enabled, splitReservedCPUsAcrossNUMA is enabled, disableHT is disabled and number of reserved CPUs per number of NUMA nodes are odd", func() {
+			reservedCPUCount = 21 // random number which results in a CPU split per NUMA node (11 + 10 in this case) such that odd number of reserved CPUs (11) have to be allocated from a NUMA node
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Errors out in case hyperthreading is enabled, splitReservedCPUsAcrossNUMA is disabled,, disableHT is disabled and number of reserved CPUs are odd", func() {
+			reservedCPUCount = 21 // random number which results in odd number (21) of CPUs to be allocated from a NUMA node
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Ensure reserved CPUs populated are correctly when splitReservedCPUsAcrossNUMA is disabled, disableHT is enabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38"))
+			Expect(isolatedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39"))
+			Expect(offlinedCPUSet.String()).To(BeEmpty())
+		})
+		It("Ensure reserved CPUs populated are correctly when splitReservedCPUsAcrossNUMA is enabled and disableHT is enabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0-19"))
+			Expect(isolatedCPUSet.String()).To(Equal("20-39"))
+			Expect(offlinedCPUSet.String()).To(BeEmpty())
+		})
+		It("Do not error out in case hyperthreading is currently enabled, splitReservedCPUsAcrossNUMA is disabled, disableHT is enabled and number of reserved CPUs allocated from a NUMA node are odd", func() {
+			reservedCPUCount = 11 // random number which results in odd number (11) of CPUs to be allocated from a NUMA node
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).ToNot(HaveOccurred())
+		})
+		It("Do not error out in case hyperthreading is currently enabled, splitReservedCPUsAcrossNUMA is enabled, disableHT is enabled and number of reserved CPUs allocated from a NUMA node are odd", func() {
+			reservedCPUCount = 2 // random number which results in odd number (1) of CPUs to be allocated from a NUMA node
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).ToNot(HaveOccurred())
+		})
+		It("Do not error out in case of a system where hyperthreading is not enabled initially, splitReservedCPUsAcrossNUMA is disabled, disableHT is enabled and number of reserved CPUs allocated are odd", func() {
+			node = newTestNode(sno)
+			reservedCPUCount = 3 // random number which results in odd number (3) of CPUs to be allocated
+			offlinedCPUCount = 0
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherSNODirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+	})
+	Context("with new offlined parameter, check if reserved, isolated and offlined CPUs are properly populated in the performance profile", func() {
+		It("Errors out in case negative offlinedCPUCount is specified", func() {
+			reservedCPUCount = 20 // random number, no meaning
+			offlinedCPUCount = -1 // random negative number, no special meaning
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			highPowerConsumptionMode := false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("please specify the offlined CPU count in the range"))
+		})
+
+		It("Errors out in case offlinedCPUCount specified is greater than the number of CPUs in system", func() {
+			reservedCPUCount = 20  // random number, no meaning
+			offlinedCPUCount = 100 // random number should be greater than the actual number of CPUs in must-gather
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			highPowerConsumptionMode := false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("please specify the offlined CPU count in the range"))
+		})
+		It("Errors out in case offlinedCPUCount plus reservedCPUCount specified is greater than the number of CPUs", func() {
+			reservedCPUCount = 40
+			offlinedCPUCount = 41
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			Expect(reservedCPUCount + offlinedCPUCount).To(BeNumerically(">", 80))
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("please ensure that reserved-cpu-count, offlined-cpu-count and ovs-dpdk-cpu-count are in range"))
+		})
+		It("with disable-ht true siblings does NOT count: Errors out in case offlinedCPUCount plus reservedCPUCount specified is greater than the number of CPUs", func() {
+			reservedCPUCount = 20
+			offlinedCPUCount = 21
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("please ensure that reserved-cpu-count, offlined-cpu-count and ovs-dpdk-cpu-count are in range"))
+		})
+		It("with disable-ht true siblings does NOT count: Errors out in case offlinedCPUCount specified is greater than the number of CPUs in system", func() {
+			reservedCPUCount = 10
+			offlinedCPUCount = 41 // should be greater than the number of cores
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = true
+			highPowerConsumptionMode := false
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("please specify the offlined CPU count in the range"))
+		})
+		It("Everything is ok in case offlinedCPUCount plus reservedCPUCount specified is equal to the number of CPUs in system", func() {
+			reservedCPUCount = 20 // random number, no meaning
+			offlinedCPUCount = 59 // random number --> both `reservedCPUCount` plus `offlinedCPUCount` should sum 79 (which is the number of CPUs in the must-gather minus 1)
+			Expect(reservedCPUCount + offlinedCPUCount).To(Equal(79))
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			_, err = CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			Expect(err).NotTo(HaveOccurred())
+		})
+		It("when splitReservedCPUsAcrossNUMA is disabled, disableHT is disabled and offlined-cpu-count is greater than number of cpus per socket then offline a complete socket", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 40 // NOT A random number: It is the number of CPUS in a socket
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			// ensure that siblings of the CPUs in each category belong to the same category (reserved/offlined/isolated)
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			isolatedSiblings := getSiblingsListForCPUSet(*systemInfo, isolatedCPUSet)
+			offlinedSiblings := getSiblingsListForCPUSet(*systemInfo, offlinedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+			Expect(isolatedSiblings).To(Equal(isolatedCPUSet))
+			Expect(offlinedSiblings).To(Equal(offlinedCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+			Expect(isolatedCPUSet.String()).To(Equal("20,22,24,26,28,30,32,34,36,38,60,62,64,66,68,70,72,74,76,78"))
+		})
+		It("when splitReservedCPUsAcrossNUMA is enabled, disableHT is disabled and offlined-cpu-count is greater than number of cpus per socket then can NOT offline a complete socket", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 40 // NOT A random number: It is the number of CPUS in a socket
+			splitReservedCPUsAcrossNUMA = true
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("10,12,14,16,18,20,22,24,26,28,50-79"))
+			Expect(reservedCPUSet.String()).To(Equal("0-9,40-49"))
+			Expect(isolatedCPUSet.String()).To(Equal("11,13,15,17,19,21,23,25,27,29-39"))
+		})
+
+		It("when in high power consumption mode, splitReservedCPUsAcrossNUMA is disabled, disableHT is disabled and offlined-cpu-count is greater than number of cpus per socket then do NOT offline a complete socket", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 40 // NOT A random number: It is the number of CPUS in a socket
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			highPowerConsumptionMode := true
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("20,22,24,26,28,30,32,34,36,38,41,43,45,47,49,51,53,55,57,59-79"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+			Expect(isolatedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39"))
+		})
+
+		It("when splitReservedCPUsAcrossNUMA is disabled, disableHT is disabled and offlined-cpu-count is less than number of cpus per socket then do NOT offline a complete socket", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 20 // NOT A random number: Should be less than the number of CPUS in a socket
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("41,43,45,47,49,51,53,55,57,59-60,62,64,66,68,70,72,74,76,78"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+			Expect(isolatedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19-39,61,63,65,67,69,71,73,75,77,79"))
+		})
+
+		It("when splitReservedCPUsAcrossNUMA is disabled, disableHT is disabled and offlined-cpu-count is greater than number of cpus per socket then offline a complete socket and then go for siblings", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 45 // NOT A random number: Should be less than the number of CPUS in a socket
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = false
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			reservedSiblings := getSiblingsListForCPUSet(*systemInfo, reservedCPUSet)
+			Expect(reservedSiblings).To(Equal(reservedCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47,49,51,53,55,57,59-69,71,73,75,77,79"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+			Expect(isolatedCPUSet.String()).To(Equal("20,22,24,26,28,30,32,34,36,38,70,72,74,76,78"))
+		})
+		It("when splitReservedCPUsAcrossNUMA is disabled, disableHT is enabled and offlined-cpu-count is the number of cpus per socket then siblings does not enter the calcs and offline a complete", func() {
+			reservedCPUCount = 10 // random number, no special meaning
+			offlinedCPUCount = 20 // NOT A random number: number of CPUs in a socket (without siblings)
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = true
+			highPowerConsumptionMode := false
+
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, highPowerConsumptionMode)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18"))
+			Expect(isolatedCPUSet.String()).To(Equal("20,22,24,26,28,30,32,34,36,38"))
+		})
+		It("Ensure offlined CPUs populated are correctly when splitReservedCPUsAcrossNUMA is disabled, disableHT is enabled and offlinedCount is less than the number of CPUs in a socket", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUCount = 4  // NOT a random number. Should be less than 40 (which is the number of CPUS in one socket)
+			splitReservedCPUsAcrossNUMA = false
+			disableHT = true
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			systemInfo, err := handle.GatherSystemInfo()
+			Expect(err).ToNot(HaveOccurred())
+			cpuSets, err := CalculateCPUSets(systemInfo, reservedCPUCount, offlinedCPUCount, 0, splitReservedCPUsAcrossNUMA, disableHT, false)
+			reservedCPUSet, isolatedCPUSet, offlinedCPUSet := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(offlinedCPUSet.Intersection(reservedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Intersection(isolatedCPUSet).IsEmpty()).To(BeTrue())
+			Expect(offlinedCPUSet.Size()).To(Equal(offlinedCPUCount))
+
+			klog.Infof("offlined:%s", offlinedCPUSet.String())
+			klog.Infof("reserved:%s", reservedCPUSet.String())
+			klog.Infof("isolated:%s", isolatedCPUSet.String())
+
+			totalCPUSet, err := GetTotalCPUSetFromGHW(handle, disableHT)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.Union(offlinedCPUSet).Union(isolatedCPUSet)).To(Equal(totalCPUSet))
+
+			Expect(offlinedCPUSet.String()).To(Equal("1,5,7,9"))
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38"))
+			Expect(isolatedCPUSet.String()).To(Equal("3,11,13,15,17,19,21,23,25,27,29,31,33,35,37,39"))
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Check if Hyperthreading enabled/disabled in a system to correctly populate reserved and isolated CPUs in the performance profile", func() {
+	var mustGatherDirAbsolutePath string
+	var node *v1.Node
+	var handle *GHWHandler
+	var err error
+
+	AfterEach(func() {
+		if handle != nil {
+			Expect(handle.Cleanup()).To(Succeed())
+			handle = nil
+		}
+	})
+
+	Context("Check if hyperthreading is enabled on the system or not", func() {
+		It("Ensure we detect correctly that hyperthreading is enabled on a system", func() {
+			node = newTestNode(worker1)
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			htEnabled, err := handle.IsHyperthreadingEnabled()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(htEnabled).To(Equal(true))
+		})
+		It("Ensure we detect correctly that hyperthreading is disabled on a system", func() {
+			node = newTestNode(worker2)
+			mustGatherDirAbsolutePath, err = filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+			handle, err = NewGHWHandler(mustGatherDirAbsolutePath, node)
+			Expect(err).ToNot(HaveOccurred())
+			htEnabled, err := handle.IsHyperthreadingEnabled()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(htEnabled).To(Equal(false))
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Test Helper Functions getCPUsSplitAcrossNUMA and getCPUsSequentially", func() {
+	var reservedCPUCount int
+	var topologyInfoNodes, htDisabledTopologyInfoNodes []*topology.Node
+	var htEnabled bool
+
+	BeforeEach(func() {
+		topologyInfoNodes = []*topology.Node{
+			{
+				ID: 0,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 0, NumThreads: 2, LogicalProcessors: []int{0, 40}},
+					{ID: 4, NumThreads: 2, LogicalProcessors: []int{2, 42}},
+					{ID: 1, NumThreads: 2, LogicalProcessors: []int{4, 44}},
+					{ID: 3, NumThreads: 2, LogicalProcessors: []int{6, 46}},
+					{ID: 2, NumThreads: 2, LogicalProcessors: []int{8, 48}},
+					{ID: 12, NumThreads: 2, LogicalProcessors: []int{10, 50}},
+					{ID: 8, NumThreads: 2, LogicalProcessors: []int{12, 52}},
+					{ID: 11, NumThreads: 2, LogicalProcessors: []int{14, 54}},
+					{ID: 9, NumThreads: 2, LogicalProcessors: []int{16, 56}},
+					{ID: 10, NumThreads: 2, LogicalProcessors: []int{18, 58}},
+					{ID: 16, NumThreads: 2, LogicalProcessors: []int{20, 60}},
+					{ID: 20, NumThreads: 2, LogicalProcessors: []int{22, 62}},
+					{ID: 17, NumThreads: 2, LogicalProcessors: []int{24, 64}},
+					{ID: 19, NumThreads: 2, LogicalProcessors: []int{26, 66}},
+					{ID: 18, NumThreads: 2, LogicalProcessors: []int{28, 68}},
+					{ID: 28, NumThreads: 2, LogicalProcessors: []int{30, 70}},
+					{ID: 24, NumThreads: 2, LogicalProcessors: []int{32, 72}},
+					{ID: 27, NumThreads: 2, LogicalProcessors: []int{34, 74}},
+					{ID: 25, NumThreads: 2, LogicalProcessors: []int{36, 76}},
+					{ID: 26, NumThreads: 2, LogicalProcessors: []int{38, 78}},
+				},
+			},
+			{
+				ID: 1,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 0, NumThreads: 2, LogicalProcessors: []int{1, 41}},
+					{ID: 4, NumThreads: 2, LogicalProcessors: []int{3, 43}},
+					{ID: 1, NumThreads: 2, LogicalProcessors: []int{5, 45}},
+					{ID: 3, NumThreads: 2, LogicalProcessors: []int{7, 47}},
+					{ID: 2, NumThreads: 2, LogicalProcessors: []int{9, 49}},
+					{ID: 12, NumThreads: 2, LogicalProcessors: []int{11, 51}},
+					{ID: 8, NumThreads: 2, LogicalProcessors: []int{13, 53}},
+					{ID: 11, NumThreads: 2, LogicalProcessors: []int{15, 55}},
+					{ID: 9, NumThreads: 2, LogicalProcessors: []int{17, 57}},
+					{ID: 10, NumThreads: 2, LogicalProcessors: []int{19, 59}},
+					{ID: 16, NumThreads: 2, LogicalProcessors: []int{21, 61}},
+					{ID: 20, NumThreads: 2, LogicalProcessors: []int{23, 63}},
+					{ID: 17, NumThreads: 2, LogicalProcessors: []int{25, 65}},
+					{ID: 19, NumThreads: 2, LogicalProcessors: []int{27, 67}},
+					{ID: 18, NumThreads: 2, LogicalProcessors: []int{29, 69}},
+					{ID: 28, NumThreads: 2, LogicalProcessors: []int{31, 71}},
+					{ID: 24, NumThreads: 2, LogicalProcessors: []int{33, 73}},
+					{ID: 27, NumThreads: 2, LogicalProcessors: []int{35, 75}},
+					{ID: 25, NumThreads: 2, LogicalProcessors: []int{37, 77}},
+					{ID: 26, NumThreads: 2, LogicalProcessors: []int{39, 79}},
+				},
+			},
+		}
+
+		htDisabledTopologyInfoNodes = []*topology.Node{
+			{
+				ID: 0,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 0, NumThreads: 1, LogicalProcessors: []int{0}},
+					{ID: 4, NumThreads: 1, LogicalProcessors: []int{2}},
+					{ID: 1, NumThreads: 1, LogicalProcessors: []int{4}},
+					{ID: 3, NumThreads: 1, LogicalProcessors: []int{6}},
+					{ID: 2, NumThreads: 1, LogicalProcessors: []int{8}},
+					{ID: 12, NumThreads: 1, LogicalProcessors: []int{10}},
+					{ID: 8, NumThreads: 1, LogicalProcessors: []int{12}},
+					{ID: 11, NumThreads: 1, LogicalProcessors: []int{14}},
+					{ID: 9, NumThreads: 1, LogicalProcessors: []int{16}},
+					{ID: 10, NumThreads: 1, LogicalProcessors: []int{18}},
+					{ID: 16, NumThreads: 1, LogicalProcessors: []int{20}},
+					{ID: 20, NumThreads: 1, LogicalProcessors: []int{22}},
+					{ID: 17, NumThreads: 1, LogicalProcessors: []int{24}},
+					{ID: 19, NumThreads: 1, LogicalProcessors: []int{26}},
+					{ID: 18, NumThreads: 1, LogicalProcessors: []int{28}},
+					{ID: 28, NumThreads: 1, LogicalProcessors: []int{30}},
+					{ID: 24, NumThreads: 1, LogicalProcessors: []int{32}},
+					{ID: 27, NumThreads: 1, LogicalProcessors: []int{34}},
+					{ID: 25, NumThreads: 1, LogicalProcessors: []int{36}},
+					{ID: 26, NumThreads: 1, LogicalProcessors: []int{38}},
+				},
+			},
+			{
+				ID: 1,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 0, NumThreads: 1, LogicalProcessors: []int{1}},
+					{ID: 4, NumThreads: 1, LogicalProcessors: []int{3}},
+					{ID: 1, NumThreads: 1, LogicalProcessors: []int{5}},
+					{ID: 3, NumThreads: 1, LogicalProcessors: []int{7}},
+					{ID: 2, NumThreads: 1, LogicalProcessors: []int{9}},
+					{ID: 12, NumThreads: 1, LogicalProcessors: []int{11}},
+					{ID: 8, NumThreads: 1, LogicalProcessors: []int{13}},
+					{ID: 11, NumThreads: 1, LogicalProcessors: []int{15}},
+					{ID: 9, NumThreads: 1, LogicalProcessors: []int{17}},
+					{ID: 10, NumThreads: 1, LogicalProcessors: []int{19}},
+					{ID: 16, NumThreads: 1, LogicalProcessors: []int{21}},
+					{ID: 20, NumThreads: 1, LogicalProcessors: []int{23}},
+					{ID: 17, NumThreads: 1, LogicalProcessors: []int{25}},
+					{ID: 19, NumThreads: 1, LogicalProcessors: []int{27}},
+					{ID: 18, NumThreads: 1, LogicalProcessors: []int{29}},
+					{ID: 28, NumThreads: 1, LogicalProcessors: []int{31}},
+					{ID: 24, NumThreads: 1, LogicalProcessors: []int{33}},
+					{ID: 27, NumThreads: 1, LogicalProcessors: []int{35}},
+					{ID: 25, NumThreads: 1, LogicalProcessors: []int{37}},
+					{ID: 26, NumThreads: 1, LogicalProcessors: []int{39}},
+				},
+			},
+		}
+	})
+	Context("Check if getCPUsSplitAcrossNUMA and getCPUsSequentially are working correctly and reserved and isolated CPUs are properly populated in the performance profile", func() {
+		It("Ensure reserved and isolated CPUs populated are correctly by getCPUsSplitAcrossNUMAwhen when splitReservedCPUsAcrossNUMA is enabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUs := cpuset.CPUSet{}
+			htEnabled = true
+
+			reservedCPUSet, err := getCPUsSplitAcrossNUMA(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0-9,40-49"))
+
+			isolatedCPUSet, err := getIsolatedCPUs(topologyInfoNodes, reservedCPUSet, offlinedCPUs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isolatedCPUSet.String()).To(Equal("10-39,50-79"))
+		})
+		It("Ensure reserved and isolated CPUs populated are correctly by getCPUsSplitAcrossNUMAwhen when splitReservedCPUsAcrossNUMA is enabled and htEnabled is disabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUs := cpuset.CPUSet{}
+			htEnabled = false
+
+			reservedCPUSet, err := getCPUsSplitAcrossNUMA(reservedCPUCount, htEnabled, htDisabledTopologyInfoNodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0-19"))
+
+			isolatedCPUSet, err := getIsolatedCPUs(htDisabledTopologyInfoNodes, reservedCPUSet, offlinedCPUs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isolatedCPUSet.String()).To(Equal("20-39"))
+		})
+		It("Errors out in case hyperthreading is enabled, splitReservedCPUsAcrossNUMA is enabled, htEnabled is enabled and the number of reserved CPUs per number of NUMA nodes are odd", func() {
+			reservedCPUCount = 21 // random number which results in a CPU split per NUMA node (11 + 10 in this case) such that odd number of reserved CPUs (11) have to be allocated from a NUMA node
+			htEnabled = true
+
+			_, err := getCPUsSplitAcrossNUMA(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Works without error in case hyperthreading is disabled, splitReservedCPUsAcrossNUMA is enabled, htEnabled is disabled and number of reserved CPUs per number of NUMA nodes are odd", func() {
+			reservedCPUCount = 11 // random number which results in a CPU split per NUMA node (5 + 6 in this case) such that odd number of reserved CPUs (5) have to be allocated from a NUMA node
+			htEnabled = false
+
+			_, err := getCPUsSplitAcrossNUMA(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).ToNot(HaveOccurred())
+		})
+		It("Ensure reserved and isolated CPUs populated are correctly by getCPUsSequentially when splitReservedCPUsAcrossNUMA is disabled", func() {
+			reservedCPUCount = 20 // random number, no special meaning
+			offlinedCPUs := cpuset.CPUSet{}
+			htEnabled = true
+
+			reservedCPUSet, err := getCPUsSequentially(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reservedCPUSet.String()).To(Equal("0,2,4,6,8,10,12,14,16,18,40,42,44,46,48,50,52,54,56,58"))
+
+			isolatedCPUSet, err := getIsolatedCPUs(topologyInfoNodes, reservedCPUSet, offlinedCPUs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isolatedCPUSet.String()).To(Equal("1,3,5,7,9,11,13,15,17,19-39,41,43,45,47,49,51,53,55,57,59-79"))
+		})
+		It("Errors out in case hyperthreading is enabled, splitReservedCPUsAcrossNUMA is disabled and number of reserved CPUs are odd", func() {
+			reservedCPUCount = 21 // random number which results in odd number (21) of CPUs to be allocated from a NUMA node
+			htEnabled = true
+
+			_, err := getCPUsSequentially(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).To(HaveOccurred())
+		})
+		It("Works without error in case hyperthreading is disabled, splitReservedCPUsAcrossNUMA is disabled and number of reserved CPUs are odd", func() {
+			reservedCPUCount = 11 // random number which results in odd number (11) of CPUs to be allocated from a NUMA node
+			htEnabled = false
+
+			_, err := getCPUsSequentially(reservedCPUCount, htEnabled, topologyInfoNodes)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Ensuring Nodes hardware equality", func() {
+	Context("Testing matching nodes with the same hardware ", func() {
+		It("should pass hardware equality test", func() {
+			mustGatherDirAbsolutePath, err := filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+
+			node1, err := getNode(mustGatherDirAbsolutePath, worker1+".yaml")
+			Expect(err).ToNot(HaveOccurred())
+			node1Handle, err := NewGHWHandler(mustGatherDirAbsolutePath, node1)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(node1Handle.Cleanup)
+
+			node2, err := getNode(mustGatherDirAbsolutePath, worker1+".yaml")
+			Expect(err).ToNot(HaveOccurred())
+			node2Handle, err := NewGHWHandler(mustGatherDirAbsolutePath, node2)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(node2Handle.Cleanup)
+
+			nodeHandles := []*GHWHandler{node1Handle, node2Handle}
+			tols := toleration.Set{}
+			err = EnsureNodesHaveTheSameHardware(nodeHandles, tols)
+			Expect(err).ToNot(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+	})
+
+	Context("Testing matching nodes with different hardware ", func() {
+		It("should fail hardware equality test", func() {
+			mustGatherDirAbsolutePath, err := filepath.Abs(mustGatherDirPath)
+			Expect(err).ToNot(HaveOccurred())
+
+			node1, err := getNode(mustGatherDirAbsolutePath, worker1+".yaml")
+			Expect(err).ToNot(HaveOccurred())
+			node1Handle, err := NewGHWHandler(mustGatherDirAbsolutePath, node1)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(node1Handle.Cleanup)
+
+			node2, err := getNode(mustGatherDirAbsolutePath, worker2+".yaml")
+			Expect(err).ToNot(HaveOccurred())
+			node2Handle, err := NewGHWHandler(mustGatherDirAbsolutePath, node2)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(node2Handle.Cleanup)
+
+			nodeHandles := []*GHWHandler{node1Handle, node2Handle}
+			err = EnsureNodesHaveTheSameHardware(nodeHandles, toleration.Set{})
+			Expect(err).To(HaveOccurred())
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Test Helper Function ensureSameTopology", func() {
+	// the below set of tests compares two topologies original one is originTopology while the one to be mutated is mutatedTopology
+	// updates must not be done on originTopology or its items
+	var nodes2 []*topology.Node
+	var mutatedTopology topology.Info
+
+	nodes1 := []*topology.Node{
+		{
+			ID: 0,
+			Cores: []*cpu.ProcessorCore{
+				{ID: 0, NumThreads: 2, LogicalProcessors: []int{0, 1}},
+				{ID: 1, NumThreads: 2, LogicalProcessors: []int{2, 3}},
+			},
+		},
+		{
+			ID: 1,
+			Cores: []*cpu.ProcessorCore{
+				{ID: 2, NumThreads: 2, LogicalProcessors: []int{4, 5}},
+				{ID: 3, NumThreads: 2, LogicalProcessors: []int{6, 7}},
+			},
+		},
+	}
+	originTopology := topology.Info{
+		Architecture: topology.ARCHITECTURE_NUMA,
+		Nodes:        nodes1,
+	}
+
+	BeforeEach(func() {
+		// this must be executed before each It() to avoid data pollution
+		nodes2 = []*topology.Node{
+			{
+				ID: 0,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 0, NumThreads: 2, LogicalProcessors: []int{0, 1}},
+					{ID: 1, NumThreads: 2, LogicalProcessors: []int{2, 3}},
+				},
+			},
+			{
+				ID: 1,
+				Cores: []*cpu.ProcessorCore{
+					{ID: 2, NumThreads: 2, LogicalProcessors: []int{4, 5}},
+					{ID: 3, NumThreads: 2, LogicalProcessors: []int{6, 7}},
+				},
+			},
+		}
+		mutatedTopology = topology.Info{
+			Architecture: topology.ARCHITECTURE_NUMA,
+			Nodes:        nodes2,
+		}
+	})
+
+	Context("Check if ensureSameTopology is working correctly", func() {
+		It("nodes with similar topology should not return error", func() {
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).ToNot(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+		It("nodes with different architecture should return error", func() {
+			mutatedTopology.Architecture = topology.ARCHITECTURE_SMP
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).To(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+		It("nodes with different number of NUMA nodes should return error", func() {
+			mutatedTopology.Nodes = mutatedTopology.Nodes[1:]
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).To(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+		It("nodes with different number threads per core should return error", func() {
+			mutatedTopology.Nodes[1].Cores[1].NumThreads = 1
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).To(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+		It("nodes with different thread IDs should return error", func() {
+			mutatedTopology.Nodes[1].Cores[1].LogicalProcessors[1] = 15
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).To(HaveOccurred())
+			_, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeFalse())
+		})
+		It("same cores with different Core IDs should still considered equivalent but with a warning", func() {
+			mutatedTopology.Nodes[0].Cores[0].ID = 3
+			tols := toleration.Set{}
+			err := ensureSameTopology(&originTopology, &mutatedTopology, tols)
+			Expect(err).ToNot(HaveOccurred())
+			val, ok := tols[toleration.DifferentCoreIDs]
+			Expect(ok).To(BeTrue())
+			Expect(val).To(BeTrue())
+
+		})
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Test Helper Function sortTopology", func() {
+	It("should sort node topologies as expected", func() {
+		unsorted := topology.Info{
+			Nodes: []*topology.Node{
+				{
+					ID: 1,
+					Cores: []*cpu.ProcessorCore{
+						{
+							ID:                5,
+							LogicalProcessors: []int{5, 7},
+						},
+						{
+							ID:                4,
+							LogicalProcessors: []int{4, 6},
+						},
+						{
+							ID:                7,
+							LogicalProcessors: []int{5, 7},
+						},
+						{
+							ID:                6,
+							LogicalProcessors: []int{6, 4},
+						},
+					},
+				},
+				{
+					ID: 0,
+					Cores: []*cpu.ProcessorCore{
+						{
+							ID:                0,
+							LogicalProcessors: []int{2, 0},
+						},
+						{
+							ID:                1,
+							LogicalProcessors: []int{1, 3},
+						},
+						{
+							ID:                2,
+							LogicalProcessors: []int{0, 2},
+						},
+						{
+							ID:                3,
+							LogicalProcessors: []int{3, 1},
+						},
+					},
+				},
+			},
+		}
+		expectedSorted := topology.Info{
+			Nodes: []*topology.Node{
+				{
+					ID: 0,
+					Cores: []*cpu.ProcessorCore{
+						{
+							ID:                0,
+							LogicalProcessors: []int{0, 2},
+						},
+						{
+							ID:                2,
+							LogicalProcessors: []int{0, 2},
+						},
+						{
+							ID:                1,
+							LogicalProcessors: []int{1, 3},
+						},
+						{
+							ID:                3,
+							LogicalProcessors: []int{1, 3},
+						},
+					},
+				},
+				{
+					ID: 1,
+					Cores: []*cpu.ProcessorCore{
+						{
+							ID:                4,
+							LogicalProcessors: []int{4, 6},
+						},
+						{
+							ID:                6,
+							LogicalProcessors: []int{4, 6},
+						},
+						{
+							ID:                5,
+							LogicalProcessors: []int{5, 7},
+						},
+						{
+							ID:                7,
+							LogicalProcessors: []int{5, 7},
+						},
+					},
+				},
+			},
+		}
+
+		sortTopology(&unsorted)
+		Expect(reflect.DeepEqual(unsorted, expectedSorted)).To(BeTrue(), "expected %+v, got %+v", expectedSorted, unsorted)
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Test Helper Function GetAdditionalKernelArgs", func() {
+	var disableHT bool
+
+	Context("with hyper-threading enabled", func() {
+		It("should not append additional kernel arguments", func() {
+			disableHT = false
+			kernelArgs := GetAdditionalKernelArgs(disableHT)
+			Expect(kernelArgs).To(BeEmpty())
+		})
+	})
+
+	Context("with hyper-threading disable", func() {
+		It("should append nosmt argument", func() {
+			disableHT = true
+			expectedArgs := []string{"nosmt"}
+			sort.Strings(expectedArgs) // sort to avoid inequality due to difference in order
+			kernelArgs := GetAdditionalKernelArgs(disableHT)
+			Expect(kernelArgs).To(BeEquivalentTo(expectedArgs))
+		})
+
+	})
+})
+
+var _ = Describe("PerformanceProfileCreator: Test Helper cpuAccumulator", func() {
+	nodes1 := []*topology.Node{
+		{
+			ID: 0,
+			Cores: []*cpu.ProcessorCore{
+				{ID: 0, NumThreads: 2, LogicalProcessors: []int{0, 1}},
+				{ID: 1, NumThreads: 2, LogicalProcessors: []int{2, 3}},
+			},
+		},
+		{
+			ID: 1,
+			Cores: []*cpu.ProcessorCore{
+				{ID: 2, NumThreads: 2, LogicalProcessors: []int{4, 5}},
+				{ID: 3, NumThreads: 2, LogicalProcessors: []int{6, 7}},
+			},
+		},
+	}
+	topology1 := topology.Info{
+		Architecture: topology.ARCHITECTURE_NUMA,
+		Nodes:        nodes1,
+	}
+
+	Context("Check if cpuAccumulator is working correctly", func() {
+		It("should accumulate allCores", func() {
+			acc := newCPUAccumulator()
+			for _, node := range topology1.Nodes {
+				_, err := acc.AddCores(allCores, node.Cores)
+				Expect(err).NotTo(HaveOccurred())
+			}
+			cores := acc.Result().List()
+			Expect(cores).Should(Equal([]int{0, 1, 2, 3, 4, 5, 6, 7}))
+		})
+		It("should accumulate cores up to the max", func() {
+			acc := newCPUAccumulator()
+			for _, node := range topology1.Nodes {
+				_, err := acc.AddCores(3, node.Cores)
+				Expect(err).NotTo(HaveOccurred())
+			}
+			cores := acc.Result().List()
+			Expect(cores).Should(Equal([]int{0, 1, 2}))
+		})
+
+		It("should not count elements already in the accumulator", func() {
+			acc := newCPUAccumulator()
+			node := topology1.Nodes[0]
+			n1, err := acc.AddCores(allCores, node.Cores)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n1).To(Equal(4))
+
+			n2, err := acc.AddCores(allCores, node.Cores)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n2).To(Equal(0))
+
+			cores := acc.Result().List()
+			Expect(cores).Should(Equal([]int{0, 1, 2, 3}))
+		})
+
+		It("should not be modified after calling Result", func() {
+			acc := newCPUAccumulator()
+			node := topology1.Nodes[0]
+			n1, err := acc.AddCores(allCores, node.Cores)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n1).To(Equal(4))
+
+			cores := acc.Result().List()
+			Expect(cores).Should(Equal([]int{0, 1, 2, 3}))
+
+			_, err = acc.AddCores(allCores, node.Cores)
+			Expect(err).To(HaveOccurred())
+		})
+
+	})
+})
+
+func GetTotalCPUSetFromCPUInfo(cpuInfo cpu.Info, disableHT bool) (cpuset.CPUSet, error) {
+	acc := newCPUAccumulator()
+	numSiblings := 0
+	for _, socket := range cpuInfo.Processors {
+		var err error
+		if disableHT {
+			_, err = acc.AddCoresWithFilter(allCores, socket.Cores, func(index, lpID int) bool {
+				if index == 0 {
+					numSiblings++
+					return true
+				}
+				return false
+			})
+		} else {
+			_, err = acc.AddCores(allCores, socket.Cores)
+		}
+
+		if err != nil {
+			return cpuset.CPUSet{}, err
+		}
+	}
+
+	ret := acc.Result()
+	if cpuInfo.TotalThreads-uint32(numSiblings) != uint32(ret.Size()) {
+		return cpuset.CPUSet{}, fmt.Errorf("error calculating total logical processors. Shold be %d but found %d", cpuInfo.TotalThreads, ret.Size())
+	}
+
+	return ret, nil
+}
+
+func GetTotalCPUSetFromGHW(handler *GHWHandler, disableHT bool) (cpuset.CPUSet, error) {
+	sortedCpuInfo, err := handler.SortedCPU()
+	if err != nil {
+		return cpuset.CPUSet{}, err
+	}
+	totalCPUSet, err := GetTotalCPUSetFromCPUInfo(*sortedCpuInfo, disableHT)
+	if err != nil {
+		return cpuset.CPUSet{}, err
+	}
+	return totalCPUSet, nil
+}
+
+var _ = Describe("PerformanceProfileCreator: OVS-DPDK CPU allocation", func() {
+	var sysInfo *systemInfo
+
+	BeforeEach(func() {
+		core0 := &cpu.ProcessorCore{ID: 0, NumThreads: 2, LogicalProcessors: []int{0, 8}}
+		core1 := &cpu.ProcessorCore{ID: 1, NumThreads: 2, LogicalProcessors: []int{1, 9}}
+		core2 := &cpu.ProcessorCore{ID: 2, NumThreads: 2, LogicalProcessors: []int{2, 10}}
+		core3 := &cpu.ProcessorCore{ID: 3, NumThreads: 2, LogicalProcessors: []int{3, 11}}
+		processor := &cpu.Processor{
+			ID:         0,
+			NumCores:   4,
+			NumThreads: 8,
+			Cores:      []*cpu.ProcessorCore{core0, core1, core2, core3},
+		}
+		cpuInfo := &cpu.Info{
+			TotalCores:   4,
+			TotalThreads: 8,
+			Processors:   []*cpu.Processor{processor},
+		}
+		sysInfo = &systemInfo{
+			HtEnabled: true,
+			CpuInfo: &extendedCPUInfo{
+				CpuInfo:                  cpuInfo,
+				NumLogicalProcessorsUsed: make(map[int]int),
+				LogicalProcessorsUsed:    make(map[int]struct{}),
+			},
+			TopologyInfo: &topology.Info{
+				Nodes: []*topology.Node{{
+					ID:    0,
+					Cores: []*cpu.ProcessorCore{core0, core1, core2, core3},
+				}},
+			},
+		}
+	})
+
+	It("allocates whole hyperthread sibling pairs for an even ovs-dpdk-cpu-count", func() {
+		cpuSets, err := CalculateCPUSets(sysInfo, 2, 0, 2, false, false, false)
+		reserved, isolated, offlined, ovsDpdk := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined, cpuSets.OvsDpdk
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ovsDpdk.Size()).To(Equal(2))
+		Expect(getSiblingsListForCPUSet(*sysInfo, ovsDpdk)).To(Equal(ovsDpdk))
+		Expect(ovsDpdk.Intersection(reserved).IsEmpty()).To(BeTrue())
+		Expect(ovsDpdk.Intersection(offlined).IsEmpty()).To(BeTrue())
+		Expect(ovsDpdk.Intersection(isolated).IsEmpty()).To(BeTrue())
+		Expect(reserved.Union(isolated).Union(offlined).Union(ovsDpdk).Size()).To(Equal(8))
+	})
+
+	It("rejects an odd ovs-dpdk-cpu-count when hyperthreading is enabled", func() {
+		_, err := CalculateCPUSets(sysInfo, 2, 0, 1, false, false, false)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("can't allocate odd number of CPUs when hyperthreading is enabled"))
+	})
+
+	It("allocates single cores (odd count allowed) when disable-ht is set", func() {
+		cpuSets, err := CalculateCPUSets(sysInfo, 2, 0, 1, false, true, false)
+		reserved, isolated, offlined, ovsDpdk := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined, cpuSets.OvsDpdk
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ovsDpdk.Size()).To(Equal(1))
+		Expect(ovsDpdk.Intersection(reserved).IsEmpty()).To(BeTrue())
+		Expect(ovsDpdk.Intersection(offlined).IsEmpty()).To(BeTrue())
+		Expect(ovsDpdk.Intersection(isolated).IsEmpty()).To(BeTrue())
+	})
+
+	It("allows odd and even ovs-dpdk-cpu-count when hyperthreading is already disabled", func() {
+		sysInfo.HtEnabled = false
+		for _, core := range sysInfo.TopologyInfo.Nodes[0].Cores {
+			core.NumThreads = 1
+			core.LogicalProcessors = core.LogicalProcessors[:1]
+		}
+		sysInfo.CpuInfo.CpuInfo.TotalThreads = 4
+		sysInfo.CpuInfo.CpuInfo.Processors[0].NumThreads = 4
+		for _, core := range sysInfo.CpuInfo.CpuInfo.Processors[0].Cores {
+			core.NumThreads = 1
+			core.LogicalProcessors = core.LogicalProcessors[:1]
+		}
+
+		cpuSetsOdd, err := CalculateCPUSets(sysInfo, 1, 0, 1, false, false, false)
+		ovsOdd := cpuSetsOdd.OvsDpdk
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ovsOdd.Size()).To(Equal(1))
+
+		cpuSetsEven, err := CalculateCPUSets(sysInfo, 1, 0, 2, false, false, false)
+		ovsEven := cpuSetsEven.OvsDpdk
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ovsEven.Size()).To(Equal(2))
+	})
+
+	It("returns an empty ovs-dpdk set when ovs-dpdk-cpu-count is zero", func() {
+		cpuSets, err := CalculateCPUSets(sysInfo, 2, 0, 0, false, false, false)
+		reserved, isolated, offlined, ovsDpdk := cpuSets.Reserved, cpuSets.Isolated, cpuSets.Offlined, cpuSets.OvsDpdk
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ovsDpdk.IsEmpty()).To(BeTrue())
+		Expect(reserved.Union(isolated).Union(offlined).Size()).To(Equal(8))
+	})
+
+	It("rejects a negative ovs-dpdk-cpu-count", func() {
+		_, err := CalculateCPUSets(sysInfo, 2, 0, -1, false, false, false)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("please specify the ovs-dpdk CPU count in the range [0,7]"))
+	})
+
+	It("rejects an ovs-dpdk-cpu-count that is not smaller than the total number of CPUs", func() {
+		_, err := CalculateCPUSets(sysInfo, 2, 0, 8, false, false, false)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("please specify the ovs-dpdk CPU count in the range [0,7]"))
+	})
+
+	It("rejects reserved plus offlined plus ovs-dpdk that leaves no isolated CPUs", func() {
+		_, err := CalculateCPUSets(sysInfo, 4, 2, 2, false, false, false)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("reserved-cpu-count, offlined-cpu-count and ovs-dpdk-cpu-count"))
+	})
+})
+
+func getSiblingsListForCPUSet(sysinfo systemInfo, cpus cpuset.CPUSet) cpuset.CPUSet {
+	cpuInfo := sysinfo.CpuInfo.CpuInfo
+	siblingsSet := sets.Set[int]{}
+	for _, cpu := range cpus.List() {
+		for _, physicalProc := range cpuInfo.Processors {
+			cores := physicalProc.Cores
+			for _, core := range cores {
+				if slices.Contains(core.LogicalProcessors, cpu) {
+					siblingsSet.Insert(core.LogicalProcessors...)
+				}
+			}
+		}
+	}
+	siblingsInt := siblingsSet.UnsortedList()
+	return cpuset.New(siblingsInt...)
+}
+
+func newTestNode(nodeName string) *v1.Node {
+	n := v1.Node{}
+	n.Name = nodeName
+	return &n
+}

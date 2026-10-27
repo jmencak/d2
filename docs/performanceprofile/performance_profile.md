@@ -1,0 +1,220 @@
+
+# Performance Profile
+
+This document documents the PerformanceProfile API introduced by the Performance controller.
+
+> This document is generated from code comments on the `PerformanceProfile` struct.
+> When contributing a change to this document please do so by changing those code comments.
+
+## Table of Contents
+* [CPU](#cpu)
+* [CPUSet](#cpuset)
+* [CPUfrequency](#cpufrequency)
+* [Device](#device)
+* [HardwareTuning](#hardwaretuning)
+* [HugePage](#hugepage)
+* [HugePageSize](#hugepagesize)
+* [HugePages](#hugepages)
+* [KernelPageSize](#kernelpagesize)
+* [NUMA](#numa)
+* [Net](#net)
+* [PerformanceProfile](#performanceprofile)
+* [PerformanceProfileList](#performanceprofilelist)
+* [PerformanceProfileSpec](#performanceprofilespec)
+* [PerformanceProfileStatus](#performanceprofilestatus)
+* [RealTimeKernel](#realtimekernel)
+* [WorkloadHints](#workloadhints)
+
+## CPU
+
+CPU defines a set of CPU related features.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| reserved | Reserved defines a set of CPUs that will not be used for any container workloads initiated by kubelet. | *[CPUSet](#cpuset) | true |
+| isolated | Isolated defines a set of CPUs that will be used to give to application threads the most execution time possible, which means removing as many extraneous tasks off a CPU as possible. It is important to notice the CPU manager can choose any CPU to run the workload except the reserved CPUs. In order to guarantee that your workload will run on the isolated CPU:\n  1. The union of reserved CPUs and isolated CPUs should include all online CPUs\n  2. The isolated CPUs field should be the complementary to reserved CPUs field | *[CPUSet](#cpuset) | true |
+| balanceIsolated | BalanceIsolated toggles whether or not the Isolated CPU set is eligible for load balancing work loads. When this option is set to \"false\", the Isolated CPU set will be static, meaning workloads have to explicitly assign each thread to a specific cpu in order to work across multiple CPUs. Setting this to \"true\" allows workloads to be balanced across CPUs. Setting this to \"false\" offers the most predictable performance for guaranteed workloads, but it offloads the complexity of cpu load balancing to the application. Defaults to \"true\" | *bool | false |
+| offlined | Offline defines a set of CPUs that will be unused and set offline | *[CPUSet](#cpuset) | false |
+| shared | Shared defines a set of CPUs that will be shared among guaranteed workloads that needs additional cpus which are not exclusive, alongside the isolated, exclusive resources that are being used already by those workloads. | *[CPUSet](#cpuset) | false |
+| ovsDpdk | OvsDpdk defines a set of CPUs dedicated for OVS-DPDK PMD (Poll Mode Driver) threads, fully isolated from the operating system and Kubernetes scheduling. WorkloadPartitioning or --strict-cpu-reservation kubelet CPUManager policy option is a prerequisite for this feature. | *[CPUSet](#cpuset) | false |
+
+[Back to TOC](#table-of-contents)
+
+## CPUSet
+
+CPUSet defines the set of CPUs(0-3,8-11).
+
+CPUSet is of type `string`.
+
+[Back to TOC](#table-of-contents)
+
+## CPUfrequency
+
+CPUfrequency defines cpu frequencies for isolated and reserved cpus
+
+CPUfrequency is of type `string`.
+
+[Back to TOC](#table-of-contents)
+
+## Device
+
+Device defines a way to represent a network device in several options: device name, vendor ID, model ID, PCI path and MAC address
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| interfaceName | Network device name to be matched. It uses a syntax of shell-style wildcards which are either positive or negative. | *string | false |
+| vendorID | Network device vendor ID represented as a 16 bit hexadecimal number. | *string | false |
+| deviceID | Network device ID (model) represented as a 16 bit hexadecimal number. | *string | false |
+
+[Back to TOC](#table-of-contents)
+
+## HardwareTuning
+
+HardwareTuning defines a set of CPU frequency related features.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| isolatedCpuFreq | IsolatedCpuFreq defines a maximum frequency to be set across isolated cpus | *[CPUfrequency](#cpufrequency) | false |
+| reservedCpuFreq | ReservedCpuFreq defines a maximum frequency to be set across reserved cpus | *[CPUfrequency](#cpufrequency) | false |
+
+[Back to TOC](#table-of-contents)
+
+## HugePage
+
+HugePage defines the number of allocated huge pages of the specific size.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| size | Size defines huge page size, maps to the 'hugepagesz' kernel boot parameter. | [HugePageSize](#hugepagesize) | false |
+| count | Count defines amount of huge pages, maps to the 'hugepages' kernel boot parameter. | int32 | false |
+| node | Node defines the NUMA node where hugepages will be allocated, if not specified, pages will be allocated equally between NUMA nodes | *int32 | false |
+
+[Back to TOC](#table-of-contents)
+
+## HugePageSize
+
+HugePageSize defines size of huge pages The allowed values for this depend on CPU architecture For x86/amd64, the valid values are 2M and 1G. For aarch64, the valid huge page sizes depend on the kernel page size: - With a 4k kernel page size: 64k, 2M, 32M, 1G - With a 64k kernel page size: 2M, 512M, 16G\n\nReference: https://docs.kernel.org/mm/vmemmap_dedup.html
+
+HugePageSize is of type `string`.
+
+[Back to TOC](#table-of-contents)
+
+## HugePages
+
+HugePages defines a set of huge pages that we want to allocate at boot.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| defaultHugepagesSize | DefaultHugePagesSize defines huge pages default size under kernel boot parameters. | *[HugePageSize](#hugepagesize) | false |
+| pages | Pages defines huge pages that we want to allocate at boot time. | [][HugePage](#hugepage) | false |
+
+[Back to TOC](#table-of-contents)
+
+## KernelPageSize
+
+KernelPageSize defines the size of the kernel pages. The allowed values for this depend on CPU architecture For x86/amd64, the only valid value is 4k. For aarch64, the valid values are 4k, 64k.
+
+KernelPageSize is of type `string`.
+
+[Back to TOC](#table-of-contents)
+
+## NUMA
+
+NUMA defines parameters related to topology awareness and affinity.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| topologyPolicy | Name of the policy applied when TopologyManager is enabled Operator defaults to \"best-effort\" | *string | false |
+
+[Back to TOC](#table-of-contents)
+
+## Net
+
+Net defines a set of network related features
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| userLevelNetworking | UserLevelNetworking when enabled - sets either all or specified network devices queue size to the amount of reserved CPUs. Defaults to \"false\". | *bool | false |
+| devices | Devices contains a list of network device representations that will be set with a netqueue count equal to CPU.Reserved . If no devices are specified then the default is all devices. | [][Device](#device) | false |
+
+[Back to TOC](#table-of-contents)
+
+## PerformanceProfile
+
+PerformanceProfile is the Schema for the performanceprofiles API
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| metadata |  | [metav1.ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#objectmeta-v1-meta) | false |
+| spec |  | [PerformanceProfileSpec](#performanceprofilespec) | false |
+| status |  | [PerformanceProfileStatus](#performanceprofilestatus) | false |
+
+[Back to TOC](#table-of-contents)
+
+## PerformanceProfileList
+
+PerformanceProfileList contains a list of PerformanceProfile
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| metadata |  | [metav1.ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#listmeta-v1-meta) | false |
+| items |  | [][PerformanceProfile](#performanceprofile) | true |
+
+[Back to TOC](#table-of-contents)
+
+## PerformanceProfileSpec
+
+PerformanceProfileSpec defines the desired state of PerformanceProfile.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| cpu | CPU defines a set of CPU related parameters. | *[CPU](#cpu) | true |
+| hardwareTuning | HardwareTuning defines a set of CPU frequencies for isolated and reserved cpus. | *[HardwareTuning](#hardwaretuning) | false |
+| hugepages | HugePages defines a set of huge pages related parameters. It is possible to set huge pages with multiple size values at the same time. For example, hugepages can be set with 1G and 2M, both values will be set on the node by the Performance Profile Controller. It is important to notice that setting hugepages default size to 1G will remove all 2M related folders from the node and it will be impossible to configure 2M hugepages under the node. | *[HugePages](#hugepages) | false |
+| machineConfigLabel | MachineConfigLabel defines the label to add to the MachineConfigs the operator creates. It has to be used in the MachineConfigSelector of the MachineConfigPool which targets this performance profile. Defaults to \"machineconfiguration.openshift.io/role=&lt;same role as in NodeSelector label key&gt;\" | map[string]string | false |
+| machineConfigPoolSelector | MachineConfigPoolSelector defines the MachineConfigPool label to use in the MachineConfigPoolSelector of resources like KubeletConfigs created by the operator. Defaults to \"machineconfiguration.openshift.io/role=&lt;same role as in NodeSelector label key&gt;\" | map[string]string | false |
+| nodeSelector | NodeSelector defines the Node label to use in the NodeSelectors of resources like Tuned created by the operator. It most likely should, but does not have to match the node label in the NodeSelector of the MachineConfigPool which targets this performance profile. In the case when machineConfigLabels or machineConfigPoolSelector are not set, we are expecting a certain NodeSelector format &lt;domain&gt;/&lt;role&gt;: \"\" in order to be able to calculate the default values for the former mentioned fields. | map[string]string | true |
+| realTimeKernel | RealTimeKernel defines a set of real time kernel related parameters. RT kernel won't be installed when not set. | *[RealTimeKernel](#realtimekernel) | false |
+| kernelPageSize | KernelPageSize defines the kernel page size. 4k is the default, 64k is only supported on aarch64 | *[KernelPageSize](#kernelpagesize) | false |
+| additionalKernelArgs | Additional kernel arguments. | []string | false |
+| numa | NUMA defines options related to topology aware affinities | *[NUMA](#numa) | false |
+| net | Net defines a set of network related features | *[Net](#net) | false |
+| globallyDisableIrqLoadBalancing | GloballyDisableIrqLoadBalancing toggles whether IRQ load balancing will be disabled for the Isolated CPU set. When the option is set to \"true\" it disables IRQs load balancing for the Isolated CPU set. Setting the option to \"false\" allows the IRQs to be balanced across all CPUs, however the IRQs load balancing can be disabled per pod CPUs when using irq-load-balancing.crio.io/cpu-quota.crio.io annotations. Defaults to \"false\" | *bool | false |
+| workloadHints | WorkloadHints defines hints for different types of workloads. It will allow defining exact set of tuned and kernel arguments that should be applied on top of the node. | *[WorkloadHints](#workloadhints) | false |
+
+[Back to TOC](#table-of-contents)
+
+## PerformanceProfileStatus
+
+PerformanceProfileStatus defines the observed state of PerformanceProfile.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| conditions | Conditions represents the latest available observations of current state. | []conditionsv1.Condition | false |
+| tuned | Tuned points to the Tuned custom resource object that contains the tuning values generated by this operator. | *string | false |
+| runtimeClass | RuntimeClass contains the name of the RuntimeClass resource created by the operator. | *string | false |
+
+[Back to TOC](#table-of-contents)
+
+## RealTimeKernel
+
+RealTimeKernel defines the set of parameters relevant for the real time kernel.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| enabled | Enabled defines if the real time kernel packages should be installed. Defaults to \"false\" | *bool | false |
+
+[Back to TOC](#table-of-contents)
+
+## WorkloadHints
+
+WorkloadHints defines the set of upper level flags for different type of workloads.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| highPowerConsumption | HighPowerConsumption defines if the node should be configured in high power consumption mode. The flag will affect the power consumption but will improve the CPUs latency. Defaults to false. | *bool | false |
+| realTime | RealTime defines if the node should be configured for the real time workload. Defaults to true. | *bool | false |
+| perPodPowerManagement | PerPodPowerManagement defines if the node should be configured in per pod power management. PerPodPowerManagement and HighPowerConsumption hints can not be enabled together. Defaults to false. | *bool | false |
+| mixedCpus | MixedCpus enables the mixed-cpu-node-plugin on the node. Defaults to false. | *bool | false |
+
+[Back to TOC](#table-of-contents)

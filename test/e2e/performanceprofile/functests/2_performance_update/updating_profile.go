@@ -1,0 +1,1991 @@
+package __performance_update
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog"
+	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+	"k8s.io/utils/cpuset"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
+	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	manifestsutil "github.com/openshift/cluster-node-tuning-operator/pkg/util"
+	testutils "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/baseload"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/cgroup"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/cgroup/controller"
+	testclient "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/client"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/cluster"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/discovery"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/events"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/hypershift"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/label"
+	testlog "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/log"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/mcps"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/nodepools"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/nodes"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/pods"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/poolname"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profilesupdate"
+	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+)
+
+type checkFunction func(context.Context, *corev1.Node) (string, error)
+
+const (
+	irqLoadBalancingAnnotation   = "irq-load-balancing.crio.io"
+	irqLoadBalancingHousekeeping = "housekeeping"
+)
+
+var _ = Describe("[rfe_id:28761][performance] Updating parameters in performance profile", func() {
+	var workerRTNodes []corev1.Node
+	var profile, initialProfile *performancev2.PerformanceProfile
+	var poolName string
+	var err error
+	var targetNode *corev1.Node
+
+	chkCmdLine := []string{"cat", "/proc/cmdline"}
+	chkKubeletConfig := []string{"cat", "/rootfs/etc/kubernetes/kubelet.conf"}
+
+	chkCmdLineFn := func(ctx context.Context, node *corev1.Node) (string, error) {
+		out, err := nodes.ExecCommand(ctx, node, chkCmdLine)
+		if err != nil {
+			return "", err
+		}
+		output := testutils.ToString(out)
+		return output, nil
+	}
+	chkKubeletConfigFn := func(ctx context.Context, node *corev1.Node) (string, error) {
+		out, err := nodes.ExecCommand(ctx, node, chkKubeletConfig)
+		if err != nil {
+			return "", err
+		}
+		output := testutils.ToString(out)
+		return output, nil
+	}
+
+	chkHugepages2MFn := func(ctx context.Context, node *corev1.Node) (string, error) {
+		count, err := countHugepagesOnNode(ctx, node, 2)
+		if err != nil {
+			return "", err
+		}
+		return strconv.Itoa(count), nil
+	}
+
+	chkHugepages1GFn := func(ctx context.Context, node *corev1.Node) (string, error) {
+		count, err := countHugepagesOnNode(ctx, node, 1024)
+		if err != nil {
+			return "", err
+		}
+		return strconv.Itoa(count), nil
+	}
+
+	nodeLabel := testutils.NodeSelectorLabels
+
+	BeforeEach(func() {
+		if discovery.Enabled() && testutils.ProfileNotFound {
+			Skip("Discovery mode enabled, performance profile not found")
+		}
+
+		workerRTNodes = getUpdatedNodes()
+		nodeIdx := pickNodeIdx(workerRTNodes)
+		targetNode = &workerRTNodes[nodeIdx]
+		profile, err = profiles.GetByNodeLabels(nodeLabel)
+		Expect(err).ToNot(HaveOccurred())
+		klog.Infof("using profile: %q", profile.Name)
+		poolName = poolname.GetByProfile(context.TODO(), profile)
+		profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+		if !hypershift.IsHypershiftCluster() {
+			klog.Infof("using performanceMCP: %q", poolName)
+			// Verify that worker have updated state equals to true
+			// the performanceMCP already checked as part of profilesupdate.WaitForTuningUpdated()
+			mcps.WaitForCondition(testutils.RoleWorker, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+		}
+	})
+
+	Context("Verify hugepages count split on two NUMA nodes", Ordered, Label(string(label.Tier2)), func() {
+		hpSize2M := performancev2.HugePageSize("2M")
+		skipTests := false
+
+		testutils.CustomBeforeAll(func() {
+			for _, node := range workerRTNodes {
+				numaInfo, err := nodes.GetNumaNodes(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				if len(numaInfo) < 2 {
+					skipTests = true
+					klog.Infof("This test need 2 NUMA nodes. The number of NUMA nodes on node %s < 2", node.Name)
+					return
+				}
+			}
+			initialProfile = profile.DeepCopy()
+		})
+
+		DescribeTable("Verify that profile parameters were updated", func(hpCntOnNuma0 int32, hpCntOnNuma1 int32) {
+			if skipTests {
+				Skip("Insufficient NUMA nodes. This test needs 2 NUMA nodes for all CNF enabled test nodes.")
+			}
+
+			By("Verifying cluster configuration matches the requirement")
+			//have total of 4 cpus so VMs can handle running the configuration
+			numaInfo, _ := nodes.GetNumaNodes(context.TODO(), &workerRTNodes[0])
+			cpuSlice := numaInfo[0][0:4]
+			isolated := performancev2.CPUSet(fmt.Sprintf("%d-%d", cpuSlice[2], cpuSlice[3]))
+			reserved := performancev2.CPUSet(fmt.Sprintf("%d-%d", cpuSlice[0], cpuSlice[1]))
+
+			By("Modifying profile")
+			profile.Spec.CPU = &performancev2.CPU{
+				BalanceIsolated: ptr.To(false),
+				Reserved:        &reserved,
+				Isolated:        &isolated,
+			}
+			profile.Spec.HugePages = &performancev2.HugePages{
+				DefaultHugePagesSize: &hpSize2M,
+				Pages: []performancev2.HugePage{
+					{
+						Count: hpCntOnNuma0,
+						Size:  hpSize2M,
+						Node:  ptr.To(int32(0)),
+					},
+					{
+						Count: hpCntOnNuma1,
+						Size:  hpSize2M,
+						Node:  ptr.To(int32(1)),
+					},
+				},
+			}
+			profile.Spec.RealTimeKernel = &performancev2.RealTimeKernel{
+				Enabled: ptr.To(true),
+			}
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			for _, node := range workerRTNodes {
+				for i := 0; i < 2; i++ {
+					nodeCmd := []string{"cat", hugepagesPathForNode(i, 2)}
+					out, err := nodes.ExecCommand(context.TODO(), &node, nodeCmd)
+					Expect(err).ToNot(HaveOccurred())
+					result := testutils.ToString(out)
+
+					t, err := strconv.Atoi(result)
+					Expect(err).ToNot(HaveOccurred())
+
+					if i == 0 {
+						Expect(int32(t)).To(Equal(hpCntOnNuma0))
+					} else {
+						Expect(int32(t)).To(Equal(hpCntOnNuma1))
+					}
+				}
+			}
+		},
+			Entry("[test_id:45023] verify uneven split of hugepages between 2 numa nodes", int32(2), int32(1)),
+			Entry("[test_id:45024] verify even split between 2 numa nodes", int32(1), int32(1)),
+		)
+
+		AfterAll(func() {
+			if skipTests {
+				return
+			}
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(initialProfile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+		})
+	})
+
+	Context("Verify that all performance profile parameters can be updated", Ordered, Label(string(label.Tier2)), func() {
+		var removedKernelArgs string
+		var expectedReserved, expectedIsolated cpuset.CPUSet
+
+		hpSize2M := performancev2.HugePageSize("2M")
+		hpSize1G := performancev2.HugePageSize("1G")
+		policy := "best-effort"
+
+		// Modify profile and verify that MCO successfully updated the node.
+		// Keep the existing reserved/isolated CPUs from the performance profile;
+		// overriding them with a tiny isolated set on large-CPU nodes inflates
+		// tuned.non_isolcpus / systemd.cpu_affinity and can drop later cmdline
+		// args such as hugepages (see test_id:34081 failures).
+		testutils.CustomBeforeAll(func() {
+			By(fmt.Sprintf("Modifying profile to nodes=%#v MCPs=%#v", profile.Spec.NodeSelector, profile.Spec.MachineConfigPoolSelector))
+			initialProfile = profile.DeepCopy()
+
+			Expect(profile.Spec.CPU).ToNot(BeNil(), "performance profile must define CPU settings")
+			Expect(profile.Spec.CPU.Reserved).ToNot(BeNil(), "performance profile must define reserved CPUs")
+			Expect(profile.Spec.CPU.Isolated).ToNot(BeNil(), "performance profile must define isolated CPUs")
+
+			var err error
+			expectedReserved, err = cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+			Expect(err).ToNot(HaveOccurred(), "failed to parse reserved CPUs from performance profile")
+			expectedIsolated, err = cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+			Expect(err).ToNot(HaveOccurred(), "failed to parse isolated CPUs from performance profile")
+			By(fmt.Sprintf("Preserving existing CPU configuration reserved=%s isolated=%s", expectedReserved.String(), expectedIsolated.String()))
+
+			profile.Spec.HugePages = &performancev2.HugePages{
+				DefaultHugePagesSize: &hpSize2M,
+				Pages: []performancev2.HugePage{
+					{
+						Count: 256,
+						Size:  hpSize2M,
+					},
+					{
+						Count: 3,
+						Size:  hpSize1G,
+					},
+				},
+			}
+			profile.Spec.NUMA = &performancev2.NUMA{
+				TopologyPolicy: &policy,
+			}
+			profile.Spec.RealTimeKernel = &performancev2.RealTimeKernel{
+				Enabled: ptr.To(false),
+			}
+
+			if profile.Spec.AdditionalKernelArgs == nil {
+				By("AdditionalKernelArgs is empty. Checking only adding new arguments")
+				profile.Spec.AdditionalKernelArgs = append(profile.Spec.AdditionalKernelArgs, "new-argument=test")
+			} else {
+				removedKernelArgs = profile.Spec.AdditionalKernelArgs[0]
+				profile.Spec.AdditionalKernelArgs = append(profile.Spec.AdditionalKernelArgs[1:], "new-argument=test")
+			}
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+		})
+
+		DescribeTable("Verify that profile parameters were updated", func(ctx context.Context, cmdFn checkFunction, parameter []string, shouldContain bool, useRegex bool) {
+			for _, node := range workerRTNodes {
+				for _, param := range parameter {
+					result, err := cmdFn(ctx, &node)
+					Expect(err).ToNot(HaveOccurred())
+					matcher := ContainSubstring(param)
+					if useRegex {
+						matcher = MatchRegexp(param)
+					}
+
+					if shouldContain {
+						Expect(result).To(matcher)
+					} else {
+						Expect(result).NotTo(matcher)
+					}
+				}
+			}
+		},
+			Entry("[test_id:34081] verify that hugepages size and count updated", context.TODO(), chkCmdLineFn, []string{"default_hugepagesz=2M", "hugepagesz=1G", "hugepages=3"}, true, false),
+			Entry("[test_id:28070] verify that hugepages updated (NUMA node unspecified)", context.TODO(), chkCmdLineFn, []string{"hugepagesz=2M"}, true, false),
+			Entry("verify that the right number of hugepages 1G is available on the system", context.TODO(), chkHugepages1GFn, []string{"3"}, true, false),
+			Entry("verify that the right number of hugepages 2M is available on the system", context.TODO(), chkHugepages2MFn, []string{"256"}, true, false),
+		)
+
+		It("[test_id:28025] verify that cpu affinity mask matches the performance profile", func() {
+			for _, node := range workerRTNodes {
+				onlineCPUs, err := nodes.GetOnlineCPUsSet(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				expectedNonIsolated := onlineCPUs.Difference(expectedIsolated)
+				expectedMask, err := components.CPUListToMaskList(expectedNonIsolated.String())
+				Expect(err).ToNot(HaveOccurred())
+
+				cmdline, err := chkCmdLineFn(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				val := nodes.FindCmdlineParam(cmdline, "tuned.non_isolcpus")
+				Expect(val).ToNot(BeEmpty(), "tuned.non_isolcpus parameter not found in %q", cmdline)
+				Expect(val).To(Equal(expectedMask),
+					"tuned.non_isolcpus=%s does not match expected non-isolated mask %s", val, expectedMask)
+			}
+		})
+
+		It("[test_id:28071] verify that isolcpus matches the performance profile", func() {
+			Expect(profile.Spec.CPU).ToNot(BeNil())
+			expectedPrefix := "managed_irq,"
+			if profile.Spec.CPU.BalanceIsolated != nil && !*profile.Spec.CPU.BalanceIsolated {
+				expectedPrefix = "domain,managed_irq,"
+			}
+			expectedIsol := expectedPrefix + expectedIsolated.String()
+			for _, node := range workerRTNodes {
+				cmdline, err := chkCmdLineFn(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				val := nodes.FindCmdlineParam(cmdline, "isolcpus")
+				Expect(val).ToNot(BeEmpty(), "isolcpus parameter not found in %q", cmdline)
+				Expect(val).To(Equal(expectedIsol),
+					"isolcpus mismatch: got %s, expected %s", val, expectedIsol)
+			}
+		})
+
+		It("[test_id:28071] verify that systemd.cpu_affinity matches non-isolated CPUs", func() {
+			for _, node := range workerRTNodes {
+				onlineCPUs, err := nodes.GetOnlineCPUsSet(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				expectedNonIsolated := onlineCPUs.Difference(expectedIsolated)
+
+				cmdline, err := chkCmdLineFn(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				val := nodes.FindCmdlineParam(cmdline, "systemd.cpu_affinity")
+				Expect(val).ToNot(BeEmpty(), "systemd.cpu_affinity parameter not found in %q", cmdline)
+				affinitySet, err := cpuset.Parse(val)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(affinitySet.Equals(expectedNonIsolated)).To(BeTrue(),
+					"systemd.cpu_affinity=%s does not match non-isolated CPUs %s", affinitySet.String(), expectedNonIsolated.String())
+			}
+		})
+
+		DescribeTable("Verify that kubelet parameters were updated", func(ctx context.Context, cmdFn checkFunction, getterFn func(kubeletCfg *kubeletconfigv1beta1.KubeletConfiguration) string, wantedValue string) {
+			for _, node := range workerRTNodes {
+				result, err := cmdFn(ctx, &node)
+				Expect(err).ToNot(HaveOccurred())
+				obj, err := manifestsutil.DeserializeObjectFromData([]byte(result), kubeletconfigv1beta1.AddToScheme)
+				Expect(err).ToNot(HaveOccurred())
+
+				kc, ok := obj.(*kubeletconfigv1beta1.KubeletConfiguration)
+				Expect(ok).To(BeTrue(), "wrong type %T", obj)
+				Expect(getterFn(kc)).To(Equal(wantedValue))
+			}
+		},
+			Entry("[test_id:28760] verify that topologyManager was updated", context.TODO(), chkKubeletConfigFn, func(k *kubeletconfigv1beta1.KubeletConfiguration) string { return k.TopologyManagerPolicy }, "best-effort"),
+		)
+
+		It("[test_id:28935] verify that reservedSystemCPUs matches the performance profile", func() {
+			for _, node := range workerRTNodes {
+				result, err := chkKubeletConfigFn(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+				obj, err := manifestsutil.DeserializeObjectFromData([]byte(result), kubeletconfigv1beta1.AddToScheme)
+				Expect(err).ToNot(HaveOccurred())
+				kc, ok := obj.(*kubeletconfigv1beta1.KubeletConfiguration)
+				Expect(ok).To(BeTrue(), "wrong type %T", obj)
+				got, err := cpuset.Parse(kc.ReservedSystemCPUs)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(got.Equals(expectedReserved)).To(BeTrue(),
+					"ReservedSystemCPUs=%s does not match expected reserved CPUs %s", got.String(), expectedReserved.String())
+			}
+		})
+
+		It("[test_id:27738] should succeed to disable the RT kernel", func() {
+			for _, node := range workerRTNodes {
+				err := nodes.HasPreemptRTKernel(context.TODO(), &node)
+				Expect(err).To(HaveOccurred())
+			}
+		})
+
+		It("[test_id:28612]Verify that Kernel arguments can me updated (added, removed) thru performance profile", func() {
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, chkCmdLine)
+				Expect(err).ToNot(HaveOccurred(), "failed to execute %s", chkCmdLine)
+				cmdline := testutils.ToString(out)
+
+				// Verifying that new argument was added
+				Expect(cmdline).To(ContainSubstring("new-argument=test"))
+
+				// Verifying that one of old arguments was removed
+				if removedKernelArgs != "" {
+					Expect(cmdline).NotTo(ContainSubstring(removedKernelArgs), "%s should be removed from /proc/cmdline", removedKernelArgs)
+				}
+			}
+		})
+
+		It("[test_id:22764] verify that by default RT kernel is disabled", func() {
+			conditionUpdating := machineconfigv1.MachineConfigPoolUpdating
+			if profile.Spec.RealTimeKernel == nil || *profile.Spec.RealTimeKernel.Enabled {
+				Skip("Skipping test - This test expects RT Kernel to be disabled. Found it to be enabled or nil.")
+			}
+			profile.Spec.RealTimeKernel = nil
+			By("Applying changes in performance profile")
+			profiles.UpdateWithRetry(profile)
+			Expect(profile.Spec.RealTimeKernel).To(BeNil(), "real time kernel setting expected in profile spec but missing")
+
+			if hypershift.IsHypershiftCluster() {
+				hostedClusterName, err := hypershift.GetHostedClusterName()
+				Expect(err).ToNot(HaveOccurred())
+				np, err := nodepools.GetByClusterName(context.TODO(), testclient.ControlPlaneClient, hostedClusterName)
+				Expect(err).ToNot(HaveOccurred())
+				By("Checking that the nodepool status will stay false")
+				Consistently(func() error {
+					return nodepools.WaitForConfigToBeReady(context.TODO(), testclient.ControlPlaneClient, np.Name, np.Namespace)
+				}, 30, 5).Should(Succeed())
+			} else {
+				By("Checking that the updating MCP status will consistently stay false")
+				Consistently(func() corev1.ConditionStatus {
+					return mcps.GetConditionStatus(poolName, conditionUpdating)
+				}, 30, 5).Should(Equal(corev1.ConditionFalse))
+			}
+
+			for _, node := range workerRTNodes {
+				err := nodes.HasPreemptRTKernel(context.TODO(), &node)
+				Expect(err).To(HaveOccurred())
+			}
+		})
+
+		AfterAll(func() {
+			// return initial configuration
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(initialProfile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+		})
+	})
+
+	// TODO - This test case is highly specific to MCP.
+	// We should workout on ideas for a similar test applicable to the Hypershift environment.
+	Context("Updating of nodeSelector parameter and node labels", Label(string(label.Tier2), string(label.OpenShift)), func() {
+		var mcp *machineconfigv1.MachineConfigPool
+		var newCnfNode *corev1.Node
+		newRole := "worker-test"
+		newLabel := fmt.Sprintf("%s/%s", testutils.LabelRole, newRole)
+		labelsDeletion := false
+		newNodeSelector := map[string]string{newLabel: ""}
+
+		//fetch existing MCP Selector if exists in profile
+		var oldMcpSelector, oldNodeSelector map[string]string
+
+		BeforeEach(func() {
+			// initialize on every run
+			labelsDeletion = false
+			//fetch the latest profile
+			profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			nonPerformancesWorkers, err := nodes.GetNonPerformancesWorkers(profile.Spec.NodeSelector)
+			Expect(err).ToNot(HaveOccurred())
+			// we need at least 2 non-performance worker nodes to satisfy pod distribution budget
+			if len(nonPerformancesWorkers) > 1 {
+				newCnfNode = &nonPerformancesWorkers[0]
+			}
+			ok, err := cluster.IsControlPlaneSchedulable(context.TODO())
+			Expect(err).ToNot(HaveOccurred(), "Unable to fetch schedulable information of control plane nodes: %v", err)
+			if ok {
+				Skip("Skipping the test - Control plane nodes are schedulable")
+			}
+
+			if newCnfNode == nil {
+				Skip("Skipping the test - cluster does not have another available worker node ")
+			}
+
+			//fetch existing MCP Selector if exists in profile
+			if profile.Spec.MachineConfigPoolSelector != nil {
+				oldMcpSelector = profile.Spec.DeepCopy().MachineConfigPoolSelector
+			}
+
+			//fetch existing Node Selector
+			if profile.Spec.NodeSelector != nil {
+				oldNodeSelector = profile.Spec.DeepCopy().NodeSelector
+			}
+			nodeLabel = newNodeSelector
+			newCnfNode.Labels[newLabel] = ""
+
+			Expect(testclient.ControlPlaneClient.Update(context.TODO(), newCnfNode)).ToNot(HaveOccurred())
+
+			//Remove the MCP Selector if exists
+			if profile.Spec.MachineConfigPoolSelector != nil {
+				By("Removing Machine Config Selector")
+				Expect(testclient.Client.Patch(context.TODO(), profile,
+					client.RawPatch(
+						types.JSONPatchType,
+						[]byte(fmt.Sprintf(`[{"op": "remove", "path": "/spec/%s"}]`, "machineConfigPoolSelector")),
+					),
+				)).ToNot(HaveOccurred())
+			}
+
+			By("Creating new MachineConfigPool")
+			mcp = mcps.New(newRole, newNodeSelector)
+			err = testclient.Client.Create(context.TODO(), mcp)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Updating Node Selector performance profile")
+			profile.Spec.NodeSelector = newNodeSelector
+			spec, err := json.Marshal(profile.Spec)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Applying changes in performance profile and waiting until mcp will start updating")
+			Expect(testclient.Client.Patch(context.TODO(), profile,
+				client.RawPatch(
+					types.JSONPatchType,
+					[]byte(fmt.Sprintf(`[{ "op": "replace", "path": "/spec", "value": %s }]`, spec)),
+				),
+			)).ToNot(HaveOccurred())
+			mcps.WaitForCondition(newRole, machineconfigv1.MachineConfigPoolUpdating, corev1.ConditionTrue)
+
+			By("Waiting when MCP finishes updates and verifying new node has MCP Selector removed")
+			mcps.WaitForCondition(newRole, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+		})
+
+		It("[test_id:28440]Verifies that nodeSelector can be updated in performance profile", func() {
+			kubeletConfig, err := nodes.GetKubeletConfig(context.TODO(), newCnfNode)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(kubeletConfig.TopologyManagerPolicy).ToNot(BeEmpty())
+			out, err := nodes.ExecCommand(context.TODO(), newCnfNode, chkCmdLine)
+			Expect(err).ToNot(HaveOccurred(), "failed to execute %s", chkCmdLine)
+			cmdline := testutils.ToString(out)
+			Expect(cmdline).To(ContainSubstring("tuned.non_isolcpus"))
+
+		})
+
+		It("[test_id:27484]Verifies that node is reverted to plain worker when the extra labels are removed", func() {
+			By("Deleting cnf labels from the node")
+			removeLabels(profile.Spec.NodeSelector, newCnfNode)
+			labelsDeletion = true
+			// Check if node is Ready
+			for i := range newCnfNode.Status.Conditions {
+				if newCnfNode.Status.Conditions[i].Type == corev1.NodeReady {
+					Expect(newCnfNode.Status.Conditions[i].Status).To(Equal(corev1.ConditionTrue))
+				}
+			}
+
+			// check that the configs reverted
+			err = nodes.HasPreemptRTKernel(context.TODO(), newCnfNode)
+			Expect(err).To(HaveOccurred())
+
+			out, err := nodes.ExecCommand(context.TODO(), newCnfNode, chkCmdLine)
+			Expect(err).ToNot(HaveOccurred(), "failed to execute %s", chkCmdLine)
+			cmdline := testutils.ToString(out)
+			Expect(cmdline).NotTo(ContainSubstring("tuned.non_isolcpus"))
+
+			kblcfg, err := nodes.GetKubeletConfig(context.TODO(), newCnfNode)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(kblcfg.ReservedSystemCPUs).NotTo(ContainSubstring("reservedSystemCPUs"))
+		})
+
+		AfterEach(func() {
+			if !labelsDeletion {
+				removeLabels(profile.Spec.NodeSelector, newCnfNode)
+			}
+
+			var selectorLabels []string
+			for k, v := range oldNodeSelector {
+				selectorLabels = append(selectorLabels, fmt.Sprintf(`"%s":"%s"`, k, v))
+			}
+			nodeSelector := strings.Join(selectorLabels, ",")
+			profile.Spec.NodeSelector = oldNodeSelector
+			spec, err := json.Marshal(profile.Spec)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(testclient.Client.Patch(context.TODO(), profile,
+				client.RawPatch(
+					types.JSONPatchType,
+					[]byte(fmt.Sprintf(`[{ "op": "replace", "path": "/spec", "value": %s }]`, spec)),
+				),
+			)).ToNot(HaveOccurred())
+
+			updatedProfile := &performancev2.PerformanceProfile{}
+			Eventually(func() string {
+				key := types.NamespacedName{
+					Name:      profile.Name,
+					Namespace: profile.Namespace,
+				}
+				Expect(testclient.Client.Get(context.TODO(), key, updatedProfile)).ToNot(HaveOccurred())
+				var updatedSelectorLabels []string
+				for k, v := range updatedProfile.Spec.NodeSelector {
+					updatedSelectorLabels = append(updatedSelectorLabels, fmt.Sprintf(`"%s":"%s"`, k, v))
+				}
+				updatedNodeSelector := strings.Join(updatedSelectorLabels, ",")
+				return updatedNodeSelector
+			}, 2*time.Minute, 15*time.Second).Should(Equal(nodeSelector))
+
+			poolName, err = mcps.GetByProfile(updatedProfile)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(testclient.Client.Delete(context.TODO(), mcp)).ToNot(HaveOccurred())
+			mcps.WaitForCondition(poolName, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+
+			// revert node label to have the expected value
+			nodeLabel = testutils.NodeSelectorLabels
+
+			//check the saved existingMcpSelector is not nil. If it's nil that means profile did not had
+			// any MCP Selector defined so nothing to restore . Else we restore the saved MCP selector
+			if oldMcpSelector != nil {
+				By("Restoring Machine config selector")
+				profile.Spec.MachineConfigPoolSelector = oldMcpSelector
+				//check we were able to marshal the old MCP Selector
+				spec, err := json.Marshal(profile.Spec)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(testclient.Client.Patch(context.TODO(), profile,
+					client.RawPatch(
+						types.JSONPatchType,
+						[]byte(fmt.Sprintf(`[{ "op": "replace", "path": "/spec", "value": %s }]`, spec)),
+					),
+				)).ToNot(HaveOccurred())
+
+				By("Applying changes in performance profile and waiting until mcp will start updating")
+				mcps.WaitForCondition(poolName, machineconfigv1.MachineConfigPoolUpdating, corev1.ConditionTrue)
+
+				By("Waiting when mcp finishes updates")
+				mcps.WaitForCondition(poolName, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+			}
+		})
+
+	})
+
+	Context("Offlined CPU API", Ordered, Label(string(label.OfflineCPUs), string(label.Tier2)), func() {
+		var numaCoreSiblings map[int]map[int][]int
+		BeforeAll(func() {
+			//Saving the old performance profile
+			initialProfile = profile.DeepCopy()
+
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"nproc", "--all"})
+				Expect(err).ToNot(HaveOccurred())
+				onlineCPUCount := testutils.ToString(out)
+
+				onlineCPUInt, err := strconv.Atoi(onlineCPUCount)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(onlineCPUInt).Should(BeNumerically(">=", 3))
+				if onlineCPUInt <= 8 {
+					Skip(fmt.Sprintf("Offlined CPU API tests need more than 8 CPUs online to work correctly, current online CPUs are %s", onlineCPUCount))
+				}
+			}
+			for _, node := range workerRTNodes {
+				numaCoreSiblings, err = nodes.GetCoreSiblings(context.TODO(), &node)
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+		})
+
+		It("[disruptive] should set offline cpus after deploy PAO", func() {
+			// Create new performance with offlined
+			reserved := performancev2.CPUSet("0")
+			isolated := performancev2.CPUSet("1")
+			offlined := performancev2.CPUSet("2-3")
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable UserLevelNetworking and add Devices in Profile")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reserved,
+				Isolated: &isolated,
+				Offlined: &offlined,
+			}
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			workerRTNodes = getUpdatedNodes()
+			//Check offlined cpus are setting correctly
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"cat", "/sys/devices/system/cpu/offline"})
+				Expect(err).ToNot(HaveOccurred())
+				offlinedOutput := testutils.ToString(out)
+				offlinedCPUSet, err := cpuset.Parse(offlinedOutput)
+				Expect(err).ToNot(HaveOccurred())
+				offlinedCPUSetProfile, err := cpuset.Parse(string(offlined))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(offlinedCPUSet.Equals(offlinedCPUSetProfile)).To(BeTrue(), "offlined CPUs mismatch: expected %q, got %q", offlinedCPUSetProfile, offlinedCPUSet)
+			}
+		})
+
+		It("[test_id:50964] Offline Higher CPUID's", func() {
+			var reserved, isolated, offline cpuset.CPUSet
+			numaTopology := copyNumaCoreSiblings(numaCoreSiblings)
+			for numaNode := range numaTopology {
+				cores := make([]int, 0)
+				for k := range numaTopology[numaNode] {
+					cores = append(cores, k)
+				}
+				sort.Ints(cores)
+				// Select the last core id
+				higherCoreIds := cores[len(cores)-1]
+				// Get cpu siblings from the selected cores and delete the selected cores from the map
+				cpusiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, higherCoreIds)
+				//offline = append(offline, cpusiblings...)
+				offline = offline.Union(cpusiblings)
+			}
+			// Get reserved core siblings from 0, 1
+			for reservedCores := 0; reservedCores < 2; reservedCores++ {
+				// Get the cpu siblings from the selected core and delete the siblings
+				// from the map. Selected siblings of cores are saved in reservedCpus
+				cpusiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, reservedCores)
+				//reserved = append(reserved, cpusiblings...)
+				reserved = reserved.Union(cpusiblings)
+			}
+
+			// Remaining core siblings available in the
+			// numaTopology map is used in isolatedCpus
+			for key := range numaTopology {
+				for k := range numaTopology[key] {
+					cpusiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, k)
+					//isolated = append(isolated, cpusiblings...)
+					isolated = isolated.Union(cpusiblings)
+				}
+			}
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+			offlinedSet := performancev2.CPUSet(offline.String())
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable reserved , isolated and offlined parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+				Offlined: &offlinedSet,
+			}
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			workerRTNodes = getUpdatedNodes()
+			// Check offlined cpus are setting correctly
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"cat", "/sys/devices/system/cpu/offline"})
+				Expect(err).ToNot(HaveOccurred())
+				offlinedOutput := testutils.ToString(out)
+				offlinedCPUSet, err := cpuset.Parse(offlinedOutput)
+				Expect(err).ToNot(HaveOccurred())
+				offlinedCPUSetProfile, err := cpuset.Parse(string(offlinedSet))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(offlinedCPUSet.Equals(offlinedCPUSetProfile)).To(BeTrue(), "offlined CPUs mismatch: expected %q, got %q", offlinedCPUSetProfile, offlinedCPUSet)
+			}
+		})
+
+		It("[test_id:50965]Offline Middle CPUID's", func() {
+			var reserved, isolated, offline cpuset.CPUSet
+			numaTopology := copyNumaCoreSiblings(numaCoreSiblings)
+			for key := range numaTopology {
+				cores := make([]int, 0)
+				for k := range numaTopology[key] {
+					cores = append(cores, k)
+				}
+				sort.Ints(cores)
+				middleCoreIds := cores[len(cores)/2]
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, middleCoreIds)
+				offline = offline.Union(siblings)
+			}
+			for reservedCores := 0; reservedCores < 2; reservedCores++ {
+				// Get the cpu siblings from the selected core and delete the siblings
+				// from the map. Selected siblings of cores are saved in reservedCpus
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, reservedCores)
+				reserved = reserved.Union(siblings)
+			}
+			// Remaining core siblings available in the
+			// numaTopology map is used in isolatedCpus
+			for key := range numaTopology {
+				for k := range numaTopology[key] {
+					siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, k)
+					isolated = isolated.Union(siblings)
+				}
+			}
+			// Create new performance with offlined
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+			offlinedSet := performancev2.CPUSet(offline.String())
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable reserved, isolated and offlined parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+				Offlined: &offlinedSet,
+			}
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			workerRTNodes = getUpdatedNodes()
+			//Check offlined cpus are setting correctly
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"cat", "/sys/devices/system/cpu/offline"})
+				Expect(err).ToNot(HaveOccurred())
+				offlinedOutput := testutils.ToString(out)
+				offlinedCPUSet, err := cpuset.Parse(offlinedOutput)
+				Expect(err).ToNot(HaveOccurred())
+				offlinedCPUSetProfile, err := cpuset.Parse(string(offlinedSet))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(offlinedCPUSet.Equals(offlinedCPUSetProfile)).To(BeTrue(), "offlined CPUs mismatch: expected %q, got %q", offlinedCPUSetProfile, offlinedCPUSet)
+			}
+		})
+
+		It("[test_id:50966]verify offlined parameter accepts multiple ranges of cpuid's", func() {
+			var reserved, isolated, offlined cpuset.CPUSet
+			numaTopology := copyNumaCoreSiblings(numaCoreSiblings)
+			if len(numaCoreSiblings[0]) < 20 {
+				Skip("This test needs systems with at least 20 cores per socket")
+			}
+			// Get reserved core siblings from 0, 1
+			for reservedCores := 0; reservedCores < 2; reservedCores++ {
+				// Get the cpu siblings from the selected core and delete the siblings
+				// from the map. Selected siblings of cores are saved in reservedCpus
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, reservedCores)
+				reserved = reserved.Union(siblings)
+			}
+			//Get Offline Core siblings . We take the total cores and
+			//from the middle we take core ids for calculating the ranges.
+			for key := range numaTopology {
+				cores := make([]int, 0)
+				for k := range numaTopology[key] {
+					cores = append(cores, k)
+				}
+				sort.Ints(cores)
+				for i := 0; i < len(cores)/2; i++ {
+					siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, cores[i])
+					offlined = offlined.Union(siblings)
+				}
+			}
+			// Remaining core siblings available in the numaTopology
+			// map is used in isolatedCpus
+			for key := range numaTopology {
+				for k := range numaTopology[key] {
+					siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, k)
+					isolated = isolated.Union(siblings)
+				}
+			}
+			// Create new performance with offlined
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+			offlinedSet := performancev2.CPUSet(offlined.String())
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable reserved, isolated and offlined parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+				Offlined: &offlinedSet,
+			}
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			workerRTNodes = getUpdatedNodes()
+			//Check offlined cpus are setting correctly
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"cat", "/sys/devices/system/cpu/offline"})
+				Expect(err).ToNot(HaveOccurred())
+				offlinedOutput := testutils.ToString(out)
+				offlinedCPUSet, err := cpuset.Parse(offlinedOutput)
+				Expect(err).ToNot(HaveOccurred())
+				offlinedCPUSetProfile, err := cpuset.Parse(string(offlinedSet))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(offlinedCPUSet.Equals(offlinedCPUSetProfile)).To(BeTrue(), "offlined CPUs mismatch: expected %q, got %q", offlinedCPUSetProfile, offlinedCPUSet)
+			}
+		})
+
+		It("[test_id:50968]verify cpus mentioned in reserved or isolated cannot be offline", func() {
+			var reserved, isolated, offlined cpuset.CPUSet
+			numaTopology := copyNumaCoreSiblings(numaCoreSiblings)
+			// Get reserved core siblings from 0, 1
+			for reservedCores := 0; reservedCores < 2; reservedCores++ {
+				// Get the cpu siblings from the selected core and delete the siblings
+				// from the map. Selected siblings of cores are saved in reservedCpus
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, reservedCores)
+				reserved = reserved.Union(siblings)
+			}
+			// Remaining core siblings available in the
+			// numaTopology map is used in isolatedCpus
+			for key := range numaTopology {
+				for k := range numaTopology[key] {
+					siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, k)
+					isolated = isolated.Union(siblings)
+				}
+			}
+			//combine both isolated and reserved
+			totalCpuSlice := cpuset.CPUSet.Union(reserved, isolated)
+			// get partial cpus from the combined cpus
+			totalList := totalCpuSlice.List()
+			offlineCpuList := totalList[:totalCpuSlice.Size()/2]
+			offlined = cpuset.New(offlineCpuList...)
+			// Create new performance with offlined
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+			offlinedSet := performancev2.CPUSet(offlined.String())
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable reserved, isolated and offlined parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+				Offlined: &offlinedSet,
+			}
+			By("Updating the performance profile")
+			EventuallyWithOffset(1, func() string {
+				err := testclient.ControlPlaneClient.Update(context.TODO(), profile)
+				if err != nil {
+					statusErr, _ := err.(*errors.StatusError)
+					return statusErr.Status().Message
+				}
+				hostedClusterName, err := hypershift.GetHostedClusterName()
+				Expect(err).ToNot(HaveOccurred())
+				testlog.Infof("HostedCluster Name: %q ", hostedClusterName)
+				np, err := nodepools.GetByClusterName(context.TODO(), testclient.ControlPlaneClient, hostedClusterName)
+				Expect(err).ToNot(HaveOccurred())
+				testlog.Infof("Nodepool Name: %q ", np.Name)
+				for _, condition := range np.Status.Conditions {
+					if condition.Type == hypershiftv1beta1.NodePoolValidTuningConfigConditionType && condition.Reason == hypershiftv1beta1.NodePoolValidationFailedReason {
+						if strings.Contains(condition.Message, "isolated and offlined cpus overlap") {
+							return condition.Message
+						}
+					}
+				}
+				return "Profile applied successfully"
+			}, 10*time.Minute, 5*time.Second).Should(ContainSubstring("isolated and offlined cpus overlap"))
+
+		})
+
+		It("[test_id:50970]Offline CPUID's from multiple numa nodes", func() {
+			var reserved, isolated, offlined cpuset.CPUSet
+			numaTopology := copyNumaCoreSiblings(numaCoreSiblings)
+			// Here we explicitly want to offline cpus from different numa nodes,
+			// hence this test requires systems with multiple numa nodes.
+			if len(numaCoreSiblings) < 2 {
+				Skip(fmt.Sprintf("This test need 2 NUMA nodes, available only %d", len(numaCoreSiblings)))
+			}
+			// Get reserved core siblings from 0, 1
+			for reservedCores := 0; reservedCores < 2; reservedCores++ {
+				// Get the cpu siblings from the selected core and delete the siblings
+				// from the map. Selected siblings of cores are saved in reservedCpus
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, reservedCores)
+				reserved = reserved.Union(siblings)
+			}
+
+			discreteCores := []int{3, 13, 15, 24, 29}
+			for _, v := range discreteCores {
+				siblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, v)
+				offlined = offlined.Union(siblings)
+			}
+			for key := range numaTopology {
+				for k := range numaTopology[key] {
+					cpusiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaTopology, k)
+					isolated = isolated.Union(cpusiblings)
+				}
+			}
+			// Create new performance with offlined
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+			offlinedSet := performancev2.CPUSet(offlined.String())
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Enable reserved, isolated and offlined parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+				Offlined: &offlinedSet,
+			}
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			workerRTNodes = getUpdatedNodes()
+			//Check offlined cpus are setting correctly
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"cat", "/sys/devices/system/cpu/offline"})
+				Expect(err).ToNot(HaveOccurred())
+				offlinedOutput := testutils.ToString(out)
+				offlinedCPUSet, err := cpuset.Parse(offlinedOutput)
+				Expect(err).ToNot(HaveOccurred())
+				offlinedCPUSetProfile, err := cpuset.Parse(string(offlinedSet))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(offlinedCPUSet.Equals(offlinedCPUSetProfile)).To(BeTrue(), "offlined CPUs mismatch: expected %q, got %q", offlinedCPUSetProfile, offlinedCPUSet)
+			}
+		})
+
+		AfterAll(func() {
+			By("Reverting the Profile")
+			profile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+			currentSpec, _ := json.Marshal(profile.Spec)
+			spec, _ := json.Marshal(initialProfile.Spec)
+			// revert only if the profile changes.
+			if !bytes.Equal(currentSpec, spec) {
+				By("Updating the performance profile")
+				profiles.UpdateWithRetry(initialProfile)
+
+				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+				profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+				profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+			}
+
+			findcmd := `find /sys/devices/system/cpu/cpu* -type f -name online -exec cat {} \;`
+			checkCpuStatusCmd := []string{"bash", "-c", findcmd}
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, checkCpuStatusCmd)
+				Expect(err).NotTo(HaveOccurred())
+				stdout := testutils.ToString(out)
+				v := strings.Split(stdout, "\n")
+				for _, val := range v {
+					Expect(val).To(Equal("1"))
+				}
+			}
+		})
+	})
+
+	Context("[rfe_id:54374][rps_mask] Network Stack Pinning", Label(string(label.RPSMask), string(label.Tier1)), func() {
+
+		BeforeEach(func() {
+			//Get Latest profile
+			profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Backing up the profile")
+			initialProfile = profile.DeepCopy()
+		})
+
+		AfterEach(func() {
+			profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			currentSpec, _ := json.Marshal(profile.Spec)
+			spec, _ := json.Marshal(initialProfile.Spec)
+			// revert only if the profile changes.
+			if bytes.Equal(currentSpec, spec) {
+				testlog.Infof("profile hasn't change, avoiding revert")
+				return
+			}
+			By("Reverting the Profile")
+			profiles.UpdateWithRetry(initialProfile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+		})
+
+		It("[test_id:56006]Verify systemd unit file gets updated when the reserved cpus are modified", func() {
+			// Enable RPS for this test since we're specifically testing RPS functionality
+			if profile.Annotations == nil {
+				profile.Annotations = make(map[string]string)
+			}
+			profile.Annotations[performancev2.PerformanceProfileEnableRpsAnnotation] = "enable"
+
+			var reserved, isolated cpuset.CPUSet
+			var onlineCPUInt int
+			for _, node := range workerRTNodes {
+				out, err := nodes.ExecCommand(context.TODO(), &node, []string{"nproc", "--all"})
+				Expect(err).ToNot(HaveOccurred())
+				onlineCPUCount := testutils.ToString(out)
+				onlineCPUInt, err = strconv.Atoi(onlineCPUCount)
+				Expect(err).ToNot(HaveOccurred())
+				if onlineCPUInt <= 8 {
+					Skip(fmt.Sprintf("This test needs more than 8 CPUs online to work correctly, current online CPUs are %s", onlineCPUCount))
+				}
+			}
+			//numaNode[node][coreId][core-siblings]
+			var numaCoreSiblings map[int]map[int][]int
+			for _, node := range workerRTNodes {
+				numaCoreSiblings, err = nodes.GetCoreSiblings(context.TODO(), &node)
+			}
+			//Lets take reserved cpus from the middle of the cpu list
+			for numaNode := range numaCoreSiblings {
+				coreids := make([]int, 0)
+				for cores := range numaCoreSiblings[numaNode] {
+					coreids = append(coreids, cores)
+				}
+				sort.Ints(coreids)
+				Expect(len(coreids)).ToNot(Equal(0))
+				middleIndex := len(coreids) / 2
+				// we need at least 4 cpus for reserved cpus
+				middleCoreIds := coreids[middleIndex-2 : middleIndex+2]
+				for _, cores := range middleCoreIds {
+					coresiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaCoreSiblings, cores)
+					reserved = reserved.Union(coresiblings)
+				}
+			}
+			for numaNode := range numaCoreSiblings {
+				for coreids := range numaCoreSiblings[numaNode] {
+					coresiblings := nodes.GetAndRemoveCpuSiblingsFromMap(numaCoreSiblings, coreids)
+					isolated = isolated.Union(coresiblings)
+				}
+			}
+			// Update performance profile
+			reservedSet := performancev2.CPUSet(reserved.String())
+			isolatedSet := performancev2.CPUSet(isolated.String())
+
+			By("Update reserved, isolated parameters")
+			profile.Spec.CPU = &performancev2.CPU{
+				Reserved: &reservedSet,
+				Isolated: &isolatedSet,
+			}
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			//Check RPS Mask after profile is updated with New reserved Cpus
+			expectedRPSCPUs, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+			Expect(err).ToNot(HaveOccurred())
+			for _, node := range workerRTNodes {
+				// Verify the systemd RPS service uses the correct RPS mask
+				var maskContent string
+				cmd := []string{"sysctl", "-n", "net.core.rps_default_mask"}
+				out, err := nodes.ExecCommand(context.TODO(), &node, cmd)
+				Expect(err).ToNot(HaveOccurred(), "failed to exec command %q on node %q", cmd, node)
+				maskContent = testutils.ToString(out)
+				rpsMaskContent := strings.Trim(maskContent, "\n")
+				rpsCPUs, err := components.CPUMaskToCPUSet(rpsMaskContent)
+				Expect(err).ToNot(HaveOccurred(), "failed to parse RPS mask %q", rpsMaskContent)
+				Expect(rpsCPUs.Equals(expectedRPSCPUs)).To(BeTrue(), "the default rps mask is different from the reserved CPUs")
+
+				// Verify all host network devices have the correct RPS mask
+				cmd = []string{
+					"find", "/rootfs/sys/devices/virtual/net",
+					"-path", "/rootfs/sys/devices/virtual/net/lo",
+					"-prune", "-o",
+					"-type", "f",
+					"-name", "rps_cpus",
+					"-exec", "cat", "{}", ";",
+				}
+				out, err = nodes.ExecCommand(context.TODO(), &node, cmd)
+				Expect(err).ToNot(HaveOccurred(), "failed to exec command %q on node %q", cmd, node.Name)
+				devsRPS := testutils.ToString(out)
+				for _, devRPS := range strings.Split(devsRPS, "\n") {
+					rpsCPUs, err = components.CPUMaskToCPUSet(devRPS)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(rpsCPUs.Equals(expectedRPSCPUs)).To(BeTrue(), "a host device rps mask is different from the reserved CPUs")
+				}
+			}
+		})
+
+		It("[test_id:54191]Verify RPS Mask is not applied by default", func() {
+			// This test verifies that RPS is disabled by default
+			// No need to modify workload hints since RPS is disabled by default now
+
+			// Ensure the profile doesn't have RPS enabled
+			if profile.Annotations != nil {
+				if val, ok := profile.Annotations[performancev2.PerformanceProfileEnableRpsAnnotation]; ok && val == "enable" {
+					delete(profile.Annotations, performancev2.PerformanceProfileEnableRpsAnnotation)
+
+					By("Updating the performance profile to ensure RPS is disabled")
+					profiles.UpdateWithRetry(profile)
+
+					By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+					profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+					By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+					profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+				}
+			}
+
+			for _, node := range workerRTNodes {
+				// Verify the systemd RPS services were not created
+				cmd := []string{"ls", "/rootfs/etc/systemd/system/update-rps@.service"}
+				_, err := nodes.ExecCommand(context.TODO(), &node, cmd)
+				Expect(err).To(HaveOccurred())
+			}
+		})
+	})
+
+	Context("ContainerRuntimeConfig", Ordered, Label(string(label.Tier2)), func() {
+		var testpodTemplate *corev1.Pod
+		BeforeAll(func() {
+			testpodTemplate = pods.GetTestPod()
+			testpodTemplate.Namespace = testutils.NamespaceTesting
+			runtimeClass := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
+			testpodTemplate.Spec.RuntimeClassName = &runtimeClass
+		})
+
+		When("exec-cpu-affinity is disabled", func() {
+			// by default the exec-cpu-affinity is enabled, thus this requires an update to the profile
+			var getter cgroup.ControllersGetter
+			var initialProfile, profile *performancev2.PerformanceProfile
+			var needsUpdate bool
+
+			BeforeEach(func() {
+				needsUpdate = false
+
+				var err error
+				getter, err = cgroup.BuildGetter(context.TODO(), testclient.DataPlaneClient, testclient.K8sClient)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(getter).ToNot(BeNil())
+
+				By("Checking if exec-cpu-affinity is disabled, if not disable it")
+				initialProfile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+				Expect(err).ToNot(HaveOccurred(), "Failed to get performance profile")
+				Expect(initialProfile).ToNot(BeNil(), "Failed to get performance profile")
+				profile = initialProfile.DeepCopy()
+				needsUpdate = false
+				if initialProfile.Annotations == nil {
+					profile.Annotations = make(map[string]string)
+				}
+
+				val, ok := profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation]
+				if !ok || val != performancev2.PerformanceProfileExecCPUAffinityDisable {
+					profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation] = performancev2.PerformanceProfileExecCPUAffinityDisable
+					needsUpdate = true
+				}
+
+				if !needsUpdate {
+					testlog.Infof("profile already has disabled execCPUAffinity: %+v", initialProfile.Annotations)
+					return
+				}
+
+				By("Updating the profile")
+				profiles.UpdateWithRetry(profile)
+				poolName := poolname.GetByProfile(context.TODO(), profile)
+				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+				profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+				profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			})
+
+			AfterEach(func() {
+				if !needsUpdate {
+					By("no need for a revert")
+					return
+				}
+				By("Restoring the profile")
+				profiles.UpdateWithRetry(initialProfile)
+				poolName := poolname.GetByProfile(context.TODO(), initialProfile)
+				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+				profilesupdate.WaitForTuningUpdating(context.TODO(), initialProfile)
+				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+				profilesupdate.WaitForTuningUpdated(context.TODO(), initialProfile)
+			})
+
+			It("should pin exec process to any exclusive CPU - guaranteed pod single container", func() {
+				By("Creating a guaranteed test pod")
+				ctx := context.TODO()
+				testPod := testpodTemplate.DeepCopy()
+				testPod.Spec.NodeName = workerRTNodes[0].Name
+				testPod.Spec.NodeSelector = map[string]string{testutils.LabelHostname: workerRTNodes[0].Name}
+				testPod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				}
+				Expect(testclient.DataPlaneClient.Create(ctx, testPod)).To(Succeed(), "Failed to create test pod: %+v", testPod)
+				DeferCleanup(func() {
+					if testPod == nil {
+						By("test pod was not created, skipping")
+						return
+					}
+					testlog.Infof("deleting pod %q", testPod.Name)
+					Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testPod)).To(Succeed())
+				})
+
+				testPod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testPod), corev1.PodReady, corev1.ConditionTrue, 5*time.Minute)
+				Expect(err).ToNot(HaveOccurred())
+
+				cpusetCfg := &controller.CpuSet{}
+				Expect(getter.Container(ctx, testPod, testPod.Spec.Containers[0].Name, cpusetCfg)).To(Succeed(), "Failed to get cpuset config for test pod")
+				cpusList, err := cpuset.Parse(cpusetCfg.Cpus)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cpusList.Size()).ToNot(BeZero())
+				testlog.Infof("allowed CPUs: %s; now exclude reserved and shared CPUs", cpusList.String())
+
+				reservedCPUs, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(reservedCPUs.Size()).ToNot(BeZero())
+				testlog.Infof("reserved CPUs: %s", reservedCPUs.String())
+				sharedCPUs := cpuset.CPUSet{}
+				if profile.Spec.CPU.Shared != nil {
+					sharedCPUs, err = cpuset.Parse(string(*profile.Spec.CPU.Shared))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(sharedCPUs.Size()).ToNot(BeZero())
+					testlog.Infof("shared CPUs: %s", sharedCPUs.String())
+				}
+				testlog.Infof("reserved CPUs: %s", reservedCPUs.String())
+				testlog.Infof("shared CPUs: %s", sharedCPUs.String())
+				exclusiveCPUs := cpusList.Difference(reservedCPUs).Difference(sharedCPUs)
+				Expect(exclusiveCPUs.Size()).ToNot(BeZero())
+				firstExclusiveCPU := exclusiveCPUs.List()[0]
+				testlog.Infof("first exclusive CPU: %d, all exclusive CPUs: %s", firstExclusiveCPU, exclusiveCPUs.String())
+
+				// The concept of retries is to avoid false positives on first check. We set a
+				// high enough number of retries to ensure that the exec process is not pinned
+				// to the first exclusive CPU always.
+				// The test finishes successfully. If, with all retries, the exec process is pinned to the first exclusive CPU,
+				// then something is likely wrong in the flow and must be investigated, hence the test fails.
+				retries := 10
+				By("Run exec commands on the pod in parallel and verify the process is pinned not only to the first exclusive CPU")
+				// Field 39 in /proc/<pid>/stat is the processor number
+				// See proc_pid_stat(5): https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+				cmd := []string{"/bin/bash", "-c", "sleep 10 & SLPID=$!; sleep 0.5; awk '{print $39}' /proc/$SLPID/stat"}
+				execProcessCPUs := make([]int, retries)
+				g, _ := errgroup.WithContext(ctx)
+				for i := 0; i < retries; i++ {
+					idx := i
+					g.Go(func() error {
+						output, err := pods.ExecCommandOnPod(testclient.K8sClient, testPod, testPod.Spec.Containers[0].Name, cmd)
+						if err != nil {
+							return fmt.Errorf("exec command failed for run %d: %w", idx, err)
+						}
+						strout := strings.TrimSpace(string(output))
+						testlog.Infof("entry %d: exec command output: %s", idx, strout)
+						cpu, err := strconv.Atoi(strout)
+						if err != nil {
+							return fmt.Errorf("entry %d: failed to parse processor number from %q: %w", idx, strout, err)
+						}
+
+						if !exclusiveCPUs.Contains(cpu) {
+							return fmt.Errorf("entry %d: exec process was pinned to a reserved or shared CPU %d", idx, cpu)
+						}
+
+						execProcessCPUs[idx] = cpu
+						return nil
+					})
+				}
+				Expect(g.Wait()).ToNot(HaveOccurred(), "One or more exec commands failed")
+
+				Expect(execProcessCPUs).ToNot(HaveEach(firstExclusiveCPU),
+					"exec process was always pinned to the first exclusive CPU %d across all %d retries", firstExclusiveCPU, retries)
+			})
+		})
+	})
+
+	Context("Verify single hyperthread allocation", Label(string(label.Tier2)), func() {
+		var originalProfile *performancev2.PerformanceProfile
+		var profileUpdated bool
+
+		BeforeEach(func() {
+			profileUpdated = false
+
+			smtLevel, err := nodes.GetSMTLevel(context.TODO(), 0, targetNode)
+			Expect(err).ToNot(HaveOccurred())
+			if smtLevel < 2 {
+				Skip("SMT must be enabled for this test (at least 2 threads per core)")
+			}
+
+			desiredAnnotation := `{"cpuManagerPolicyOptions": {"full-pcpus-only": "false"}}`
+			if profile.Annotations != nil && profile.Annotations["kubeletconfig.experimental"] == desiredAnnotation {
+				testlog.Infof("full-pcpus-only=false annotation already set, skipping profile update")
+				return
+			}
+
+			originalProfile = profile.DeepCopy()
+
+			By("Setting full-pcpus-only=false in performance profile")
+			if profile.Annotations == nil {
+				profile.Annotations = make(map[string]string)
+			}
+			profile.Annotations["kubeletconfig.experimental"] = desiredAnnotation
+			profiles.UpdateWithRetry(profile)
+
+			poolName := poolname.GetByProfile(context.TODO(), profile)
+			By(fmt.Sprintf("Waiting for %s to start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting for %s to finish updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			profileUpdated = true
+		})
+
+		AfterEach(func() {
+			if !profileUpdated {
+				return
+			}
+
+			By("Reverting profile to original annotations")
+			currentProfile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			currentProfile.Annotations = originalProfile.Annotations
+			profiles.UpdateWithRetry(currentProfile)
+
+			poolName := poolname.GetByProfile(context.TODO(), currentProfile)
+			By(fmt.Sprintf("Waiting for %s to start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), currentProfile)
+
+			By(fmt.Sprintf("Waiting for %s to finish updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), currentProfile)
+		})
+
+		It("[test_id:86346] Verify housekeeping works correctly with single hyperthread allocation", func() {
+			ctx := context.TODO()
+
+			By("Creating a housekeeping pod requesting 1 CPU (single hyperthread)")
+			annotations := map[string]string{
+				irqLoadBalancingAnnotation: irqLoadBalancingHousekeeping,
+			}
+			testpod := getTestPodWithProfileAndAnnotations(profile, annotations, 1)
+			testpod.Spec.NodeName = targetNode.Name
+
+			err = testclient.DataPlaneClient.Create(ctx, testpod)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed()) }()
+
+			testpod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+			Expect(err).ToNot(HaveOccurred())
+			logEventsForPod(testpod)
+
+			By("Getting housekeeping CPUs from container")
+			containerName := testpod.Spec.Containers[0].Name
+			housekeepingCPUSet, err := getContainerHouskeepCpuSet(testpod, containerName)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get OPENSHIFT_HOUSEKEEPING_CPUS from container")
+
+			By("Getting container's assigned CPUs")
+			containerCpuSet, err := getContainerCpuSet(ctx, testpod, containerName)
+			Expect(err).ToNot(HaveOccurred())
+
+			testlog.Infof("Container CPUs: %v, Housekeeping CPUs: %v", containerCpuSet, housekeepingCPUSet)
+
+			By("Verifying single hyperthread allocation succeeded")
+			Expect(containerCpuSet.Size()).To(Equal(1), "Expected container to have exactly 1 CPU (single hyperthread) with full-pcpus-only=false")
+
+			By("Verifying housekeeping CPUs match container's assigned CPU")
+			Expect(housekeepingCPUSet.Equals(containerCpuSet)).To(BeTrue(),
+				"Housekeeping CPUs %v should match container CPUs %v",
+				housekeepingCPUSet, containerCpuSet)
+
+			By("Verifying IRQ SMP affinity is correctly configured")
+			isReflected, err := isSmpReflectingHousekeeping(ctx, targetNode, housekeepingCPUSet, containerCpuSet)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isReflected).To(BeTrue(), "IRQ SMP affinity should correctly reflect housekeeping CPUs")
+		})
+	})
+
+	Context("Verify housekeeping CPU assignment when SMT is disabled", Label(string(label.Slow), string(label.Tier2)), func() {
+		var originalProfile *performancev2.PerformanceProfile
+		var profileUpdated bool
+		var newIsolatedCPUs cpuset.CPUSet
+
+		BeforeEach(func() {
+			profileUpdated = false
+			// Check if SMT is currently enabled
+			smtLevel, err := nodes.GetSMTLevel(context.TODO(), 0, targetNode)
+			Expect(err).ToNot(HaveOccurred())
+			if smtLevel < 2 {
+				Skip("SMT must be enabled initially to test disabling it with nosmt")
+			}
+
+			// Check if nosmt is already applied
+			hasNosmt := false
+			for _, arg := range profile.Spec.AdditionalKernelArgs {
+				if arg == "nosmt" {
+					hasNosmt = true
+					break
+				}
+			}
+
+			if hasNosmt {
+				testlog.Infof("nosmt already applied, using existing CPU configuration")
+				newIsolatedCPUs, err = cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+				Expect(err).ToNot(HaveOccurred())
+				return
+			}
+
+			originalProfile = profile.DeepCopy()
+			ctx := context.TODO()
+
+			By("Computing new CPU topology for nosmt")
+			reservedCPUSet, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+			Expect(err).ToNot(HaveOccurred())
+			coreSiblings, err := nodes.GetCoreSiblings(ctx, targetNode)
+			Expect(err).ToNot(HaveOccurred())
+			nosmtOnlineCPUs := cpuset.New()
+			for _, numaMap := range coreSiblings {
+				for _, siblings := range numaMap {
+					if len(siblings) > 0 {
+						minCPU := siblings[0]
+						for _, cpu := range siblings {
+							if cpu < minCPU {
+								minCPU = cpu
+							}
+						}
+						nosmtOnlineCPUs = nosmtOnlineCPUs.Union(cpuset.New(minCPU))
+					}
+				}
+			}
+			newReservedCPUs := reservedCPUSet.Intersection(nosmtOnlineCPUs)
+			if newReservedCPUs.IsEmpty() {
+				Skip("No reserved CPUs would remain online with nosmt")
+			}
+			newIsolatedCPUs = nosmtOnlineCPUs.Difference(newReservedCPUs)
+			if newIsolatedCPUs.IsEmpty() {
+				Skip("No isolated CPUs would remain online with nosmt")
+			}
+
+			By("Updating performance profile with nosmt and adjusted CPU topology")
+			newReservedStr := performancev2.CPUSet(newReservedCPUs.String())
+			newIsolatedStr := performancev2.CPUSet(newIsolatedCPUs.String())
+			profile.Spec.CPU.Reserved = &newReservedStr
+			profile.Spec.CPU.Isolated = &newIsolatedStr
+			profile.Spec.AdditionalKernelArgs = append(profile.Spec.AdditionalKernelArgs, "nosmt")
+
+			profiles.UpdateWithRetry(profile)
+
+			poolName := poolname.GetByProfile(ctx, profile)
+			By(fmt.Sprintf("Waiting for %s to start updating (applying nosmt)", poolName))
+			profilesupdate.WaitForTuningUpdating(ctx, profile)
+
+			By(fmt.Sprintf("Waiting for %s to finish updates (applying nosmt)", poolName))
+			profilesupdate.WaitForTuningUpdated(ctx, profile)
+
+			By("Verifying node is healthy after nosmt application")
+			Eventually(func() error {
+				_, err := nodes.ExecCommand(ctx, targetNode, []string{"echo", "health-check"})
+				return err
+			}).WithPolling(10*time.Second).WithTimeout(5*time.Minute).Should(Succeed(),
+				"Node %s may be stuck after nosmt application - check kubelet and CPU configuration", targetNode.Name)
+
+			By("Verifying SMT is disabled on the node")
+			smtActiveCmd := []string{"cat", "/rootfs/sys/devices/system/cpu/smt/active"}
+			smtOutput, err := nodes.ExecCommand(ctx, targetNode, smtActiveCmd)
+			Expect(err).ToNot(HaveOccurred())
+			smtActive := strings.TrimSpace(testutils.ToString(smtOutput))
+			Expect(smtActive).To(Equal("0"), "SMT should be disabled (smt/active should be 0)")
+
+			profileUpdated = true
+		})
+
+		AfterEach(func() {
+			if !profileUpdated {
+				return
+			}
+
+			ctx := context.TODO()
+
+			// Step 1: Remove nosmt kernel arg only, keep nosmt-compatible CPU config
+			By("Removing nosmt kernel argument while keeping nosmt-compatible CPU config")
+			currentProfile, err := profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			currentProfile.Spec.AdditionalKernelArgs = originalProfile.Spec.AdditionalKernelArgs
+			profiles.UpdateWithRetry(currentProfile)
+
+			poolName := poolname.GetByProfile(ctx, currentProfile)
+			By(fmt.Sprintf("Waiting for %s to start updating (removing nosmt)", poolName))
+			profilesupdate.WaitForTuningUpdating(ctx, currentProfile)
+
+			By(fmt.Sprintf("Waiting for %s to finish updates (removing nosmt)", poolName))
+			profilesupdate.WaitForTuningUpdated(ctx, currentProfile)
+
+			By("Verifying node is healthy after nosmt removal")
+			Eventually(func() error {
+				_, err := nodes.ExecCommand(ctx, targetNode, []string{"echo", "health-check"})
+				return err
+			}).WithPolling(10*time.Second).WithTimeout(5*time.Minute).Should(Succeed(),
+				"Node %s is not responsive after nosmt removal", targetNode.Name)
+
+			// Step 2: Restore original CPU config
+			By("Step 2: Restoring original CPU configuration")
+			currentProfile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			currentProfile.Spec.CPU = originalProfile.Spec.CPU
+			profiles.UpdateWithRetry(currentProfile)
+
+			By(fmt.Sprintf("Waiting for %s to start updating (restoring CPU config)", poolName))
+			profilesupdate.WaitForTuningUpdating(ctx, currentProfile)
+
+			By(fmt.Sprintf("Waiting for %s to finish updates (restoring CPU config)", poolName))
+			profilesupdate.WaitForTuningUpdated(ctx, currentProfile)
+
+			By("Verifying node is healthy after full restoration")
+			Eventually(func() error {
+				_, err := nodes.ExecCommand(ctx, targetNode, []string{"echo", "post-restore-check"})
+				return err
+			}).WithPolling(10*time.Second).WithTimeout(5*time.Minute).Should(Succeed(),
+				"Node %s is not responsive after profile restoration", targetNode.Name)
+		})
+
+		It("[test_id:86347] Verify housekeeping selects single CPU when SMT is disabled", func() {
+			ctx := context.TODO()
+
+			cpuRequest := 2
+
+			By("Checking available CPU capacity on node")
+			nodeLoad, err := baseload.ForNode(ctx, testclient.DataPlaneClient, targetNode.Name)
+			Expect(err).ToNot(HaveOccurred())
+			testlog.Infof("Current node load: %d cores, available: %d",
+				nodeLoad.CPURequestedCores(), nodeLoad.AvailableCPUs(newIsolatedCPUs.Size()))
+
+			if !nodeLoad.HasCapacityFor(cpuRequest, newIsolatedCPUs.Size()) {
+				Skip(fmt.Sprintf("Not enough available isolated CPUs for nosmt test: requested %d, total isolated %d, cores in use %d",
+					cpuRequest, newIsolatedCPUs.Size(), nodeLoad.CPURequestedCores()))
+			}
+
+			By(fmt.Sprintf("Creating a housekeeping pod with %d CPUs", cpuRequest))
+			annotations := map[string]string{
+				irqLoadBalancingAnnotation: irqLoadBalancingHousekeeping,
+			}
+			testpod := getTestPodWithProfileAndAnnotations(profile, annotations, cpuRequest)
+			testpod.Spec.NodeName = targetNode.Name
+
+			err = testclient.DataPlaneClient.Create(ctx, testpod)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { Expect(pods.DeleteAndSync(ctx, testclient.DataPlaneClient, testpod)).To(Succeed()) }()
+
+			testpod, err = pods.WaitForCondition(ctx, client.ObjectKeyFromObject(testpod), corev1.PodReady, corev1.ConditionTrue, 10*time.Minute)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Getting housekeeping CPUs from container")
+			containerName := testpod.Spec.Containers[0].Name
+			housekeepingCPUSet, err := getContainerHouskeepCpuSet(testpod, containerName)
+			Expect(err).ToNot(HaveOccurred(), "Failed to get OPENSHIFT_HOUSEKEEPING_CPUS from container")
+
+			By("Getting container's assigned CPUs")
+			containerCpuSet, err := getContainerCpuSet(ctx, testpod, containerName)
+			Expect(err).ToNot(HaveOccurred())
+
+			testlog.Infof("Container CPUs: %v, Housekeeping CPUs: %v", containerCpuSet, housekeepingCPUSet)
+
+			By(fmt.Sprintf("Verifying container got %d CPUs", cpuRequest))
+			Expect(containerCpuSet.Size()).To(Equal(cpuRequest), "Container should have exactly %d CPUs with nosmt", cpuRequest)
+
+			By("Verifying housekeeping CPUs are a subset of container's assigned CPUs")
+			Expect(housekeepingCPUSet.IsSubsetOf(containerCpuSet)).To(BeTrue(),
+				"Housekeeping CPUs %v should be a subset of container CPUs %v when SMT is disabled",
+				housekeepingCPUSet, containerCpuSet)
+
+			By("Verifying housekeeping selected only 1 CPU (no sibling pairing needed with noSMT)")
+			Expect(housekeepingCPUSet.Size()).To(Equal(1),
+				"With noSMT, housekeeping should select only 1 CPU (no siblings), but got %v",
+				housekeepingCPUSet)
+
+			By("Verifying housekeeping CPU is reflected in IRQ SMP affinity")
+			isReflected, err := isSmpReflectingHousekeeping(ctx, targetNode, housekeepingCPUSet, containerCpuSet)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isReflected).To(BeTrue(), "IRQ SMP affinity should correctly reflect housekeeping when SMT is disabled")
+		})
+	})
+
+	Context("Deactivating topology and resource managers", func() {
+		var initialProfile *performancev2.PerformanceProfile
+		var targetNode *corev1.Node
+
+		BeforeEach(func() {
+			var err error
+			profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			workerRTNodes, err := nodes.GetByLabels(testutils.NodeSelectorLabels)
+			Expect(err).ToNot(HaveOccurred())
+
+			workerRTNodes, err = nodes.MatchingOptionalSelector(workerRTNodes)
+			Expect(err).ToNot(HaveOccurred(), "Error looking for the optional selector: %v", err)
+			Expect(workerRTNodes).ToNot(BeEmpty(), "No RT worker node found!")
+			targetNode = &workerRTNodes[0]
+
+			initialProfile = profile.DeepCopy()
+
+			By("Adding the DRA resource management annotation to the profile")
+			if profile.Annotations == nil {
+				profile.Annotations = make(map[string]string)
+			}
+			profile.Annotations[performancev2.PerformanceProfileDRAResourceManagementAnnotation] = "true"
+
+			By("Updating the performance profile")
+			profiles.UpdateWithRetry(profile)
+
+			poolName := poolname.GetByProfile(context.TODO(), profile)
+			By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+			profilesupdate.WaitForTuningUpdating(context.TODO(), profile)
+
+			By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+			profilesupdate.WaitForTuningUpdated(context.TODO(), profile)
+
+			DeferCleanup(func() {
+				By("Reverting the performance profile")
+				profiles.UpdateWithRetry(initialProfile)
+
+				poolName := poolname.GetByProfile(context.TODO(), initialProfile)
+				By(fmt.Sprintf("Applying changes in performance profile and waiting until %s will start updating", poolName))
+				profilesupdate.WaitForTuningUpdating(context.TODO(), initialProfile)
+
+				By(fmt.Sprintf("Waiting when %s finishes updates", poolName))
+				profilesupdate.WaitForTuningUpdated(context.TODO(), initialProfile)
+
+				By("Verifying managers are restored to their original configuration")
+				kubeletConfig, err := nodes.GetKubeletConfig(context.TODO(), targetNode)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Verifying CPU manager policy is restored to static")
+				Expect(kubeletConfig.CPUManagerPolicy).To(Equal("static"), "CPUManagerPolicy should be 'static' after revert, got %q", kubeletConfig.CPUManagerPolicy)
+
+				By("Verifying Topology manager policy is restored")
+				expectedTopologyPolicy := kubeletconfigv1beta1.BestEffortTopologyManagerPolicy
+				if initialProfile.Spec.NUMA != nil && initialProfile.Spec.NUMA.TopologyPolicy != nil {
+					expectedTopologyPolicy = *initialProfile.Spec.NUMA.TopologyPolicy
+				}
+				Expect(kubeletConfig.TopologyManagerPolicy).To(Equal(expectedTopologyPolicy), "TopologyManagerPolicy should be %q after revert, got %q", expectedTopologyPolicy, kubeletConfig.TopologyManagerPolicy)
+
+				By("Verifying Memory manager policy is restored")
+				// Memory manager is set to Static only for restricted or single-numa-node topology policies
+				if expectedTopologyPolicy == kubeletconfigv1beta1.RestrictedTopologyManagerPolicy ||
+					expectedTopologyPolicy == kubeletconfigv1beta1.SingleNumaNodeTopologyManagerPolicy {
+					Expect(kubeletConfig.MemoryManagerPolicy).To(Equal("Static"), "MemoryManagerPolicy should be 'Static' after revert, got %q", kubeletConfig.MemoryManagerPolicy)
+				}
+			})
+		})
+
+		It("should disable CPU, Memory, and Topology managers when DRA annotation is set", func() {
+			kubeletConfig, err := nodes.GetKubeletConfig(context.TODO(), targetNode)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Verifying CPU manager policy is set to none")
+			Expect(kubeletConfig.CPUManagerPolicy).To(Equal("none"), "CPUManagerPolicy should be 'none' when DRA is enabled, got %q", kubeletConfig.CPUManagerPolicy)
+
+			By("Verifying Topology manager policy is set to none")
+			Expect(kubeletConfig.TopologyManagerPolicy).To(Equal(kubeletconfigv1beta1.NoneTopologyManagerPolicy), "TopologyManagerPolicy should be 'none' when DRA is enabled, got %q", kubeletConfig.TopologyManagerPolicy)
+
+			By("Verifying Memory manager policy is set to None")
+			Expect(kubeletConfig.MemoryManagerPolicy).To(Equal(kubeletconfigv1beta1.NoneMemoryManagerPolicy), "MemoryManagerPolicy should be 'None' when DRA is enabled, got %q", kubeletConfig.MemoryManagerPolicy)
+		})
+	})
+
+})
+
+func logEventsForPod(testPod *corev1.Pod) {
+	evs, err := events.GetEventsForObject(testclient.DataPlaneClient, testPod.Namespace, testPod.Name, string(testPod.UID))
+	if err != nil {
+		testlog.Error(err)
+	}
+	for _, event := range evs.Items {
+		testlog.Warningf("-> %s %s %s", event.Action, event.Reason, event.Message)
+	}
+}
+
+func pickNodeIdx(nodes []corev1.Node) int {
+	name, ok := os.LookupEnv("E2E_PAO_TARGET_NODE")
+	if !ok {
+		return 0 // "random" default
+	}
+	for idx := range nodes {
+		if nodes[idx].Name == name {
+			testlog.Infof("node %q found among candidates, picking", name)
+			return idx
+		}
+	}
+	testlog.Infof("node %q not found among candidates, fall back to random one", name)
+	return 0 // "safe" default
+}
+
+func getTestPodWithProfileAndAnnotations(perfProf *performancev2.PerformanceProfile, annotations map[string]string, cpus int) *corev1.Pod {
+	testpod := pods.GetTestPod()
+	if len(annotations) > 0 {
+		testpod.Annotations = annotations
+	}
+	testpod.Namespace = testutils.NamespaceTesting
+
+	cpuCount := fmt.Sprintf("%d", cpus)
+
+	resCpu := resource.MustParse(cpuCount)
+	resMem := resource.MustParse("256Mi")
+
+	// change pod resource requirements, to change the pod QoS class to guaranteed
+	testpod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resCpu,
+			corev1.ResourceMemory: resMem,
+		},
+	}
+
+	if perfProf != nil {
+		runtimeClassName := components.GetComponentName(perfProf.Name, components.ComponentNamePrefix)
+		testpod.Spec.RuntimeClassName = &runtimeClassName
+	}
+
+	return testpod
+}
+
+func getContainerHouskeepCpuSet(testpod *corev1.Pod, containerName string) (cpuset.CPUSet, error) {
+	getHousekeepCpusCmd := []string{"printenv", "OPENSHIFT_HOUSEKEEPING_CPUS"}
+	testpodHousekeepCpusByte, err := pods.ExecCommandOnPod(testclient.K8sClient, testpod, containerName, getHousekeepCpusCmd)
+	if err != nil {
+		testlog.Warningf("error exec pod for housekeeping cpus: %v", err)
+		return cpuset.New(), err
+	}
+	testpodHousekeepCpusStr := strings.TrimSpace(string(testpodHousekeepCpusByte))
+	housekeepingCPUSet, err := cpuset.Parse(testpodHousekeepCpusStr)
+	if err != nil {
+		testlog.Warningf("error parsing housekeeping cpuset: %v", err)
+		return cpuset.New(), err
+	}
+	testlog.Infof("Housekeeping CPUs (parsed): %v", housekeepingCPUSet)
+	return housekeepingCPUSet, err
+}
+
+func getContainerCpuSet(ctx context.Context, testpod *corev1.Pod, containerName string) (cpuset.CPUSet, error) {
+	getter, err := cgroup.BuildGetter(ctx, testclient.DataPlaneClient, testclient.K8sClient)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	cpusetCfg := &controller.CpuSet{}
+	err = getter.Container(ctx, testpod, containerName, cpusetCfg)
+	if err != nil {
+		return cpuset.New(), err
+	}
+	return cpuset.Parse(cpusetCfg.Cpus)
+}
+
+func isSmpReflectingHousekeeping(ctx context.Context, node *corev1.Node, housekeepCPUSet, containerCpuSet cpuset.CPUSet) (bool, error) {
+	minusCpuSet := containerCpuSet.Difference(housekeepCPUSet)
+	irqSmpAffinity, err := nodes.GetDefaultSmpAffinitySet(ctx, node)
+	if err != nil {
+		testlog.Errorf("failed getting default SMP affinity set")
+		return false, err
+	}
+	testlog.Infof("SMP Affinity: %v", irqSmpAffinity)
+
+	if minusCpuSet.IsEmpty() {
+		// All container CPUs are housekeeping CPUs; just ensure all of housekeeping is in SMP affinity.
+		if housekeepCPUSet.IsSubsetOf(irqSmpAffinity) {
+			return true, nil
+		}
+		testlog.Errorf("housekeeping cpuset is not a subset of SMP affinity; housekeepCPUSet=%v, irqSmpAffinity=%v", housekeepCPUSet, irqSmpAffinity)
+		return false, nil
+	}
+
+	// There are CPUs in minus set, i.e., assigned cpus which are not housekeeping.
+	// All of housekeeping must still be in SMP, but also, minus set must NOT be in SMP (should not be subset).
+	isHousekeepingSubset := housekeepCPUSet.IsSubsetOf(irqSmpAffinity)
+	isMinusSetSubset := minusCpuSet.IsSubsetOf(irqSmpAffinity)
+
+	if isHousekeepingSubset && !isMinusSetSubset {
+		return true, nil
+	}
+
+	testlog.Errorf("unexpected SMP affinity, housekeeping subset: %v, non-housekeeping subset: %v, housekeepCPUSet=%v, minusCpuSet=%v, irqSmpAffinity=%v", isHousekeepingSubset, isMinusSetSubset, housekeepCPUSet, minusCpuSet, irqSmpAffinity)
+	return false, nil
+}
+
+func hugepagesPathForNode(nodeID, sizeINMb int) string {
+	return fmt.Sprintf("/sys/devices/system/node/node%d/hugepages/hugepages-%dkB/nr_hugepages", nodeID, sizeINMb*1024)
+}
+
+func countHugepagesOnNode(ctx context.Context, node *corev1.Node, sizeInMb int) (int, error) {
+	numaInfo, err := nodes.GetNumaNodes(ctx, node)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for i := 0; i < len(numaInfo); i++ {
+		nodeCmd := []string{"cat", hugepagesPathForNode(i, sizeInMb)}
+		out, err := nodes.ExecCommand(ctx, node, nodeCmd)
+		if err != nil {
+			return 0, err
+		}
+		result := testutils.ToString(out)
+		t, err := strconv.Atoi(result)
+		if err != nil {
+			return 0, err
+		}
+		count += t
+	}
+	return count, nil
+}
+
+func getUpdatedNodes() []corev1.Node {
+	workerRTNodes, err := nodes.GetByLabels(testutils.NodeSelectorLabels)
+	Expect(err).ToNot(HaveOccurred())
+	klog.Infof("updated nodes from %#v: %v", testutils.NodeSelectorLabels, getNodeNames(workerRTNodes))
+	workerRTNodes, err = nodes.MatchingOptionalSelector(workerRTNodes)
+	klog.Infof("updated nodes matching optional selector: %v", getNodeNames(workerRTNodes))
+	Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("error looking for the optional selector: %v", err))
+	Expect(workerRTNodes).ToNot(BeEmpty(), "cannot find RT enabled worker nodes")
+	return workerRTNodes
+}
+
+func getNodeNames(nodes []corev1.Node) []string {
+	names := []string{}
+	for _, node := range nodes {
+		names = append(names, node.Name)
+	}
+	return names
+}
+
+func removeLabels(nodeSelector map[string]string, targetNode *corev1.Node) {
+	ExpectWithOffset(1, testclient.Client.Get(context.TODO(), client.ObjectKeyFromObject(targetNode), targetNode)).ToNot(HaveOccurred())
+	patchNode := false
+	for l := range nodeSelector {
+		if _, ok := targetNode.Labels[l]; ok {
+			patchNode = true
+			testlog.Infof("found key: %q in targetNode.Labels, deleting it", l)
+			delete(targetNode.Labels, l)
+		}
+	}
+	if !patchNode {
+		testlog.Warningf("node %q does not contain nodeSelector %v", targetNode.Name, nodeSelector)
+		return
+	}
+	label, err := json.Marshal(targetNode.Labels)
+	ExpectWithOffset(1, err).ToNot(HaveOccurred())
+	ExpectWithOffset(1, testclient.Client.Patch(context.TODO(), targetNode,
+		client.RawPatch(
+			types.JSONPatchType,
+			[]byte(fmt.Sprintf(`[{ "op": "replace", "path": "/metadata/labels", "value": %s }]`, label)),
+		),
+	)).ToNot(HaveOccurred())
+	By(fmt.Sprintf("Waiting for MCP %q to start updating", testutils.RoleWorker))
+	mcps.WaitForCondition(testutils.RoleWorker, machineconfigv1.MachineConfigPoolUpdating, corev1.ConditionTrue)
+
+	By(fmt.Sprintf("Waiting when MCP %q complete updates and verifying that node reverted back configuration", testutils.RoleWorker))
+	mcps.WaitForCondition(testutils.RoleWorker, machineconfigv1.MachineConfigPoolUpdated, corev1.ConditionTrue)
+}
+
+// copyNumaCoreSiblings copies the existing numa topology to another
+// map required for offline tests.
+func copyNumaCoreSiblings(src map[int]map[int][]int) map[int]map[int][]int {
+	dst := make(map[int]map[int][]int)
+	for k, v := range src {
+		coresiblings := make(map[int][]int)
+		for core, cpus := range v {
+			newslice := make([]int, len(cpus))
+			copy(newslice, cpus)
+			coresiblings[core] = newslice
+		}
+		dst[k] = coresiblings
+	}
+	return dst
+}

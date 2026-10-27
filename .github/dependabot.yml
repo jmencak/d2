@@ -1,0 +1,39 @@
+# Version updates are suppressed so that only *security* updates produce pull
+# requests.  This keeps the steady-state PR queue empty while still surfacing
+# vulnerable dependencies promptly.
+#
+# `open-pull-requests-limit: 0` disables version-update PRs.  Security updates
+# have a separate fixed limit of 10 and and are still created when GitHub's
+# advisory database flags a dependency in go.mod/go.sum.
+
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    allow:
+      - dependency-type: "all"
+    groups:
+      golang-dependencies:
+        applies-to: security-updates
+        patterns:
+          - "golang.org/*"
+      k8s-dependencies:
+        applies-to: security-updates
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      openshift-dependencies:
+        applies-to: security-updates
+        patterns:
+          - "github.com/openshift/*"
+          - "github.com/openshift-eng/*"
+          - "github.com/openshift-kni/*"
+    # 0 means that only security updates are allowed.
+    # https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file#open-pull-requests-limit
+    # https://docs.github.com/en/code-security/dependabot/dependabot-security-updates/configuring-dependabot-security-updates#overriding-the-default-behavior-with-a-configuration-file
+    open-pull-requests-limit: 0
+    # Reviewers are auto-assigned by Prow.  Set 'jmencak' as assignee for tracking.
+    assignees:
+      - "jmencak"
+    commit-message:
+      prefix: "NO-JIRA: chore(deps)"

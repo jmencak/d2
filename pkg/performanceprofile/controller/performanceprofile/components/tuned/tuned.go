@@ -1,0 +1,332 @@
+package tuned
+
+import (
+	"bytes"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"text/template"
+
+	tunedv1 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/tuned/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/cpuset"
+	"k8s.io/utils/ptr"
+
+	assets "github.com/openshift/cluster-node-tuning-operator/assets/performanceprofile"
+	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	profilecomponent "github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components/profile"
+)
+
+const (
+	cmdlineDelimiter                        = " "
+	templateIsolatedCpus                    = "IsolatedCpus"
+	templateStaticIsolation                 = "StaticIsolation"
+	templateDefaultHugepagesSize            = "DefaultHugepagesSize"
+	templateHugepages                       = "Hugepages"
+	templateAdditionalArgs                  = "AdditionalArgs"
+	templateGloballyDisableIrqLoadBalancing = "GloballyDisableIrqLoadBalancing"
+	templateNetDevices                      = "NetDevices"
+	templateRealTimeHint                    = "RealTimeHint"
+	templateHighPowerConsumption            = "HighPowerConsumption"
+	templatePerPodPowerManagement           = "PerPodPowerManagement"
+	templateHardwareTuning                  = "HardwareTuning"
+	templateIsolatedCpuMaxFreq              = "IsolatedCpuMaxFreq"
+	templateReservedCpuMaxFreq              = "ReservedCpuMaxFreq"
+	templateIsolatedCpuList                 = "IsolatedCpuList"
+	templateReservedCpuList                 = "ReservedCpuList"
+	templatePerformanceProfileName          = "PerformanceProfileName"
+	templateIrqAffinityCpus                 = "IrqAffinityCpus"
+)
+
+func new(name string, profiles []tunedv1.TunedProfile, recommends []tunedv1.TunedRecommend) *tunedv1.Tuned {
+	return &tunedv1.Tuned{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: tunedv1.SchemeGroupVersion.String(),
+			Kind:       "Tuned",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: components.NamespaceNodeTuningOperator,
+		},
+		Spec: tunedv1.TunedSpec{
+			Profile:   profiles,
+			Recommend: recommends,
+		},
+	}
+}
+
+// NewNodePerformance returns tuned profile for performance sensitive workflows
+func NewNodePerformance(profile *performancev2.PerformanceProfile) (*tunedv1.Tuned, error) {
+	templateArgs := make(map[string]interface{})
+
+	templateArgs[templatePerformanceProfileName] = profile.Name
+
+	if profile.Spec.CPU.Isolated != nil {
+		isolatedSet, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse isolated cpuset: %v", err)
+		}
+
+		if profile.Spec.CPU.OvsDpdk != nil && *profile.Spec.CPU.OvsDpdk != "" {
+			ovsDpdkSet, err := cpuset.Parse(string(*profile.Spec.CPU.OvsDpdk))
+			if err != nil {
+				return nil, fmt.Errorf("cannot parse ovsDpdk cpuset %q: %v", string(*profile.Spec.CPU.OvsDpdk), err)
+			}
+			isolatedSet = isolatedSet.Union(ovsDpdkSet)
+
+			allCpus := isolatedSet
+			if profile.Spec.CPU.Reserved != nil {
+				reservedSet, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+				if err != nil {
+					return nil, fmt.Errorf("cannot parse reserved cpuset: %v", err)
+				}
+				allCpus = allCpus.Union(reservedSet)
+			}
+			if profile.Spec.CPU.Shared != nil {
+				sharedSet, err := cpuset.Parse(string(*profile.Spec.CPU.Shared))
+				if err != nil {
+					return nil, fmt.Errorf("cannot parse shared cpuset: %v", err)
+				}
+				allCpus = allCpus.Union(sharedSet)
+			}
+			templateArgs[templateIrqAffinityCpus] = allCpus.Difference(ovsDpdkSet).String()
+		}
+
+		templateArgs[templateIsolatedCpus] = isolatedSet.String()
+		templateArgs[templateIsolatedCpuList] = isolatedSet.List()
+	}
+
+	if profile.Spec.CPU.Reserved != nil {
+		minifiedCpuSet, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse reserved cpuset: %v", err)
+		}
+		templateArgs[templateReservedCpuList] = minifiedCpuSet.List()
+	}
+
+	if profile.Spec.CPU.BalanceIsolated != nil && !*profile.Spec.CPU.BalanceIsolated {
+		templateArgs[templateStaticIsolation] = strconv.FormatBool(true)
+	}
+
+	if profile.Spec.HardwareTuning != nil {
+		templateArgs[templateHardwareTuning] = strconv.FormatBool(true)
+		templateArgs[templateIsolatedCpuMaxFreq] = int(*profile.Spec.HardwareTuning.IsolatedCpuFreq)
+		templateArgs[templateReservedCpuMaxFreq] = int(*profile.Spec.HardwareTuning.ReservedCpuFreq)
+	}
+
+	if profile.Spec.HugePages != nil {
+		// Validate that if hugepages are configured, defaultHugepagesSize must be provided
+		if len(profile.Spec.HugePages.Pages) > 0 && profile.Spec.HugePages.DefaultHugePagesSize == nil {
+			return nil, fmt.Errorf("hugepages are configured but defaultHugepagesSize is not set")
+		}
+
+		var defaultHugepageSize performancev2.HugePageSize
+		if profile.Spec.HugePages.DefaultHugePagesSize != nil {
+			defaultHugepageSize = *profile.Spec.HugePages.DefaultHugePagesSize
+			templateArgs[templateDefaultHugepagesSize] = string(defaultHugepageSize)
+		}
+
+		var is2MHugepagesRequested *bool
+		var hugepages []string
+		for _, page := range profile.Spec.HugePages.Pages {
+			// we can not allocate huge pages on the specific NUMA node via kernel boot arguments
+			if page.Node != nil {
+				// a user requested to allocate 2M huge pages on the specific NUMA node,
+				// append dummy kernel arguments
+				if page.Size == components.HugepagesSize2M && is2MHugepagesRequested == nil {
+					is2MHugepagesRequested = ptr.To(true)
+				}
+				continue
+			}
+
+			// a user requested to allocated 2M huge pages without specifying the node
+			// we need to append 2M hugepages kernel arguments anyway, no need to add dummy
+			// kernel arguments
+			if page.Size == components.HugepagesSize2M {
+				is2MHugepagesRequested = ptr.To(false)
+			}
+
+			hugepages = append(hugepages, fmt.Sprintf("hugepagesz=%s", string(page.Size)))
+			hugepages = append(hugepages, fmt.Sprintf("hugepages=%d", page.Count))
+		}
+
+		// append dummy 2M huge pages kernel arguments to guarantee that the kernel will create 2M related files
+		// and directories under the filesystem
+		if is2MHugepagesRequested != nil && *is2MHugepagesRequested {
+			if defaultHugepageSize == components.HugepagesSize1G {
+				hugepages = append(hugepages, fmt.Sprintf("hugepagesz=%s", components.HugepagesSize2M))
+				hugepages = append(hugepages, fmt.Sprintf("hugepages=%d", 0))
+			}
+		}
+
+		hugepagesArgs := strings.Join(hugepages, cmdlineDelimiter)
+		templateArgs[templateHugepages] = hugepagesArgs
+	}
+
+	if profile.Spec.AdditionalKernelArgs != nil {
+		templateArgs[templateAdditionalArgs] = strings.Join(profile.Spec.AdditionalKernelArgs, cmdlineDelimiter)
+	}
+
+	if IsIRQBalancingGloballyDisabled(profile) {
+		templateArgs[templateGloballyDisableIrqLoadBalancing] = strconv.FormatBool(true)
+	}
+
+	if profile.Spec.Net != nil && profile.Spec.Net.UserLevelNetworking != nil &&
+		*profile.Spec.Net.UserLevelNetworking && profile.Spec.CPU.Reserved != nil {
+		reservedSet, err := cpuset.Parse(string(*profile.Spec.CPU.Reserved))
+		if err != nil {
+			return nil, err
+		}
+		reserveCPUcount := reservedSet.Size()
+
+		var devices []string
+		var tunedNetDevicesOutput []string
+		netPluginSequence := 0
+		netPluginString := ""
+
+		for _, device := range profile.Spec.Net.Devices {
+			devices = make([]string, 0)
+			if device.DeviceID != nil {
+				devices = append(devices, "^ID_MODEL_ID="+*device.DeviceID)
+			}
+			if device.VendorID != nil {
+				devices = append(devices, "^ID_VENDOR_ID="+*device.VendorID)
+			}
+			if device.InterfaceName != nil {
+				deviceNameAmendedRegex := strings.Replace(*device.InterfaceName, "*", ".*", -1)
+				if strings.HasPrefix(*device.InterfaceName, "!") {
+					// Strip the exclamation sign from the regex to avoid duplicating it
+					devices = append(devices, "^INTERFACE="+"(?!"+deviceNameAmendedRegex[1:]+")")
+				} else {
+					devices = append(devices, "^INTERFACE="+deviceNameAmendedRegex)
+				}
+			}
+			// Final regex format can be one of the following formats:
+			// devicesUdevRegex = ^INTERFACE=InterfaceName'        (InterfaceName can also hold .* representing * wildcard)
+			// devicesUdevRegex = ^INTERFACE(?!InterfaceName)'    (InterfaceName can starting with ?! represents ! wildcard)
+			// devicesUdevRegex = ^ID_VENDOR_ID=VendorID'
+			// devicesUdevRegex = ^ID_MODEL_ID=DeviceID[\s\S]*^ID_VENDOR_ID=VendorID'
+			// devicesUdevRegex = ^ID_MODEL_ID=DeviceID[\s\S]*^ID_VENDOR_ID=VendorID[\s\S]*^INTERFACE=InterfaceName'
+			// devicesUdevRegex = ^ID_MODEL_ID=DeviceID[\s\S]*^ID_VENDOR_ID=VendorID[\s\S]*^INTERFACE=(?!InterfaceName)'
+			// Important note: The order of the key must be preserved - INTERFACE, ID_MODEL_ID, ID_VENDOR_ID (in that order)
+			devicesUdevRegex := strings.Join(devices, `[\s\S]*`)
+			if netPluginSequence > 0 {
+				netPluginString = "_" + strconv.Itoa(netPluginSequence)
+			}
+			tunedNetDevicesOutput = append(tunedNetDevicesOutput, fmt.Sprintf("\n[net%s]\ntype=net\ndevices_udev_regex=%s\nchannels=combined %d", netPluginString, devicesUdevRegex, reserveCPUcount))
+			netPluginSequence++
+		}
+		if len(tunedNetDevicesOutput) == 0 {
+			templateArgs[templateNetDevices] = fmt.Sprintf("[net]\nchannels=combined %d", reserveCPUcount)
+		} else {
+			templateArgs[templateNetDevices] = strings.Join(tunedNetDevicesOutput, "")
+		}
+	}
+
+	if IsRealTimeHintEnabled(profile) {
+		templateArgs[templateRealTimeHint] = "true"
+	}
+
+	if IsHighPowerConsumptionHintEnabled(profile) && IsPerPodPowerManagementEnabled(profile) {
+		err := fmt.Errorf("Invalid WorkloadHints configuration: HighPowerConsumption is %t and PerPodPowerManagement is %t", *profile.Spec.WorkloadHints.HighPowerConsumption, *profile.Spec.WorkloadHints.PerPodPowerManagement)
+		return nil, err
+	} else if IsHighPowerConsumptionHintEnabled(profile) {
+		templateArgs[templateHighPowerConsumption] = "true"
+	} else if IsPerPodPowerManagementEnabled(profile) {
+		templateArgs[templatePerPodPowerManagement] = "true"
+	}
+
+	profileData, err := getProfileData(filepath.Join("tuned", components.ProfileNamePerformance), templateArgs)
+	if err != nil {
+		return nil, err
+	}
+	name := components.GetComponentName(profile.Name, components.ProfileNamePerformance)
+
+	RealTimeKernelProfileData, err := getProfileData(filepath.Join("tuned", components.ProfileNamePerformanceRT), templateArgs)
+	if err != nil {
+		return nil, err
+	}
+	RealTimeKernelProfileName := components.GetComponentName(profile.Name, components.ProfileNamePerformanceRT)
+
+	AmdX86ProfileData, err := getProfileData(filepath.Join("tuned", components.ProfileNameAmdX86), templateArgs)
+	if err != nil {
+		return nil, err
+	}
+	AmdX86ProfileName := components.GetComponentName(profile.Name, components.ProfileNameAmdX86)
+
+	ArmAarch64ProfileData, err := getProfileData(filepath.Join("tuned", components.ProfileNameArmAarch64), templateArgs)
+	if err != nil {
+		return nil, err
+	}
+	ArmAarch64ProfileName := components.GetComponentName(profile.Name, components.ProfileNameArmAarch64)
+
+	IntelX86ProfileData, err := getProfileData(filepath.Join("tuned", components.ProfileNameIntelX86), templateArgs)
+	if err != nil {
+		return nil, err
+	}
+	IntelX86ProfileName := components.GetComponentName(profile.Name, components.ProfileNameIntelX86)
+
+	profiles := []tunedv1.TunedProfile{
+		{
+			Name: &name,
+			Data: &profileData,
+		},
+		{
+			Name: &RealTimeKernelProfileName,
+			Data: &RealTimeKernelProfileData,
+		},
+		{
+			Name: &AmdX86ProfileName,
+			Data: &AmdX86ProfileData,
+		},
+		{
+			Name: &ArmAarch64ProfileName,
+			Data: &ArmAarch64ProfileData,
+		},
+		{
+			Name: &IntelX86ProfileName,
+			Data: &IntelX86ProfileData,
+		},
+	}
+
+	priority := int64(20)
+	recommends := []tunedv1.TunedRecommend{
+		{
+			Profile:             &name,
+			Priority:            &priority,
+			MachineConfigLabels: profilecomponent.GetMachineConfigLabel(profile),
+		},
+	}
+	return new(name, profiles, recommends), nil
+}
+
+func getProfileData(tunedTemplate string, data interface{}) (string, error) {
+	profileTemplate, err := template.ParseFS(assets.Tuned, tunedTemplate)
+	if err != nil {
+		return "", err
+	}
+
+	profile := &bytes.Buffer{}
+	if err := profileTemplate.Execute(profile, data); err != nil {
+		return "", err
+	}
+	return profile.String(), nil
+}
+
+func IsIRQBalancingGloballyDisabled(profile *performancev2.PerformanceProfile) bool {
+	return profile.Spec.GloballyDisableIrqLoadBalancing != nil && *profile.Spec.GloballyDisableIrqLoadBalancing
+}
+
+func IsRealTimeHintEnabled(profile *performancev2.PerformanceProfile) bool {
+	return profile.Spec.WorkloadHints == nil || profile.Spec.WorkloadHints.RealTime == nil || *profile.Spec.WorkloadHints.RealTime
+}
+
+func IsHighPowerConsumptionHintEnabled(profile *performancev2.PerformanceProfile) bool {
+	return profile.Spec.WorkloadHints != nil && profile.Spec.WorkloadHints.HighPowerConsumption != nil && *profile.Spec.WorkloadHints.HighPowerConsumption
+}
+
+func IsPerPodPowerManagementEnabled(profile *performancev2.PerformanceProfile) bool {
+	return profile.Spec.WorkloadHints != nil && profile.Spec.WorkloadHints.PerPodPowerManagement != nil && *profile.Spec.WorkloadHints.PerPodPowerManagement
+}

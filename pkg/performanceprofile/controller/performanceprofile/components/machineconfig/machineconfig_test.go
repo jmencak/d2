@@ -1,0 +1,642 @@
+package machineconfig
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"k8s.io/utils/ptr"
+
+	igntypes "github.com/coreos/ignition/v2/config/v3_2/types"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/types"
+	configv1 "github.com/openshift/api/config/v1"
+	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+	"sigs.k8s.io/yaml"
+
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	testutils "github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/utils/testing"
+)
+
+var spaceRegex = regexp.MustCompile(`\s*`)
+
+const hugepagesAllocationService = `
+      - contents: |
+          [Unit]
+          Description=Hugepages-1048576kB allocation on the node 0
+          Before=kubelet.service
+
+          [Service]
+          Environment=HUGEPAGES_COUNT=4
+          Environment=HUGEPAGES_SIZE=1048576
+          Environment=NUMA_NODE=0
+          Type=oneshot
+          RemainAfterExit=true
+          ExecStart=/usr/local/bin/hugepages-allocation.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        enabled: true
+        name: hugepages-allocation-1048576kB-NUMA0.service
+`
+
+const offlineCPUS = `
+      - contents: |
+          [Unit]
+          Description=Set cpus offline: 6,7
+          Before=kubelet.service
+
+          [Service]
+          Environment=OFFLINE_CPUS=6,7
+          Type=oneshot
+          RemainAfterExit=true
+          ExecStart=/usr/local/bin/set-cpus-offline.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        enabled: true
+        name: set-cpus-offline.service
+`
+
+const clearBannedCPUs = `
+      - contents: |
+          [Unit]
+          Description=Clear the IRQBalance Banned CPU mask early in the boot
+          Before=kubelet.service
+          Before=irqbalance.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=true
+          ExecStart=/usr/local/bin/clear-irqbalance-banned-cpus.sh
+
+          [Install]
+          WantedBy=multi-user.target
+        enabled: true
+        name: clear-irqbalance-banned-cpus.service
+`
+
+var CPUs = []int{1, 2, 3, 4, 5, 6, 7, 8, 9}
+var CPUstring = "1,2,3,4,5,6,7,8,9"
+
+var _ = Describe("Machine Config", func() {
+
+	Context("machine config creation ", func() {
+		It("should create machine config with valid assets", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Spec.HugePages.Pages[0].Node = ptr.To(int32(0))
+
+			_, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Context("machine config creation with disabled RPS", func() {
+		It("should create machine config with no trace of RPS", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Annotations = map[string]string{}
+			profile.Annotations[performancev2.PerformanceProfileEnableRpsAnnotation] = "false"
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, f := range result.Storage.Files {
+				Expect(f.Path).To(Not(ContainSubstring("rps")), "rps configuration %s should not be present", f.Path)
+			}
+
+			for _, f := range result.Systemd.Units {
+				Expect(f.Name).To(Not(ContainSubstring("rps")), "rps systemd unit %s should not be present", f.Name)
+			}
+		})
+
+		It("should create machine config with no trace of RPS when explicitly disabled with 'disable'", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Annotations = map[string]string{}
+			profile.Annotations[performancev2.PerformanceProfileEnableRpsAnnotation] = "disable"
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, f := range result.Storage.Files {
+				Expect(f.Path).To(Not(ContainSubstring("rps")), "rps configuration %s should not be present", f.Path)
+			}
+
+			for _, f := range result.Systemd.Units {
+				Expect(f.Name).To(Not(ContainSubstring("rps")), "rps systemd unit %s should not be present", f.Name)
+			}
+		})
+	})
+
+	Context("machine config creation with CRI-O runtime config", func() {
+		crioRuntimeConfigPath := filepath.Join(crioConfd, crioRuntimesConfig)
+
+		It("should create machine config with exec-cpu-affinity set by default", func() {
+			profile := testutils.NewPerformanceProfile("test")
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			Expect(json.Unmarshal(mc.Spec.Config.Raw, &result)).To(Succeed())
+
+			var content string
+			for _, f := range result.Storage.Files {
+				if f.Path == crioRuntimeConfigPath {
+					base64Data := strings.TrimPrefix(*f.Contents.Source, "data:text/plain;charset=utf-8;base64,")
+					decoded, err := base64.StdEncoding.DecodeString(base64Data)
+					Expect(err).ToNot(HaveOccurred())
+					content = string(decoded)
+					break
+				}
+			}
+			Expect(content).ToNot(BeEmpty(), "crio runtime config not found")
+			Expect(content).To(ContainSubstring("exec_cpu_affinity = \"first\""))
+		})
+
+		It("should create machine config without exec-cpu-affinity when annotation is set to none", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Annotations = map[string]string{}
+			profile.Annotations[performancev2.PerformanceProfileExecCPUAffinityAnnotation] = performancev2.PerformanceProfileExecCPUAffinityDisable
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			Expect(json.Unmarshal(mc.Spec.Config.Raw, &result)).To(Succeed())
+
+			var content string
+			for _, f := range result.Storage.Files {
+				if f.Path == crioRuntimeConfigPath {
+					base64Data := strings.TrimPrefix(*f.Contents.Source, "data:text/plain;charset=utf-8;base64,")
+					decoded, err := base64.StdEncoding.DecodeString(base64Data)
+					Expect(err).ToNot(HaveOccurred())
+					content = string(decoded)
+					break
+				}
+			}
+			Expect(content).ToNot(BeEmpty(), "crio runtime config not found")
+			Expect(content).To(Not(ContainSubstring("exec_cpu_affinity = \"first\"")))
+		})
+
+		It("should create machine config with min_injected_gomaxprocs set to 4", func() {
+			profile := testutils.NewPerformanceProfile("test")
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			Expect(json.Unmarshal(mc.Spec.Config.Raw, &result)).To(Succeed())
+
+			var content string
+			for _, f := range result.Storage.Files {
+				if f.Path == crioRuntimeConfigPath {
+					base64Data := strings.TrimPrefix(*f.Contents.Source, "data:text/plain;charset=utf-8;base64,")
+					decoded, err := base64.StdEncoding.DecodeString(base64Data)
+					Expect(err).ToNot(HaveOccurred())
+					content = string(decoded)
+					break
+				}
+			}
+			Expect(content).ToNot(BeEmpty(), "crio runtime config not found")
+			Expect(content).To(ContainSubstring("min_injected_gomaxprocs = 4"))
+		})
+	})
+
+	Context("machine config creation with enabled RPS using alternative values", func() {
+		It("should create machine config with RPS configuration when enabled with 'enable'", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Annotations = map[string]string{}
+			profile.Annotations[performancev2.PerformanceProfileEnableRpsAnnotation] = "enable"
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Should have RPS-related files and services
+			rpsFilesFound := false
+			for _, f := range result.Storage.Files {
+				if strings.Contains(f.Path, "rps") {
+					rpsFilesFound = true
+					break
+				}
+			}
+			Expect(rpsFilesFound).To(BeTrue(), "RPS configuration files should be present")
+		})
+	})
+
+	Context("with hugepages with specified NUMA node and offlinedCPUs", func() {
+		var manifest string
+
+		BeforeEach(func() {
+			profile := testutils.NewPerformanceProfile("test")
+			profile.Spec.HugePages.Pages[0].Node = ptr.To(int32(0))
+
+			labelKey, labelValue := components.GetFirstKeyAndValue(profile.Spec.MachineConfigLabel)
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mc.Spec.KernelType).To(Equal(MCKernelRT))
+
+			y, err := yaml.Marshal(mc)
+			Expect(err).ToNot(HaveOccurred())
+
+			manifest = string(y)
+			Expect(manifest).To(ContainSubstring(fmt.Sprintf("%s: %s", labelKey, labelValue)))
+		})
+
+		It("should not add hugepages kernel boot parameters", func() {
+			Expect(manifest).ToNot(ContainSubstring("- hugepagesz=1G"))
+			Expect(manifest).ToNot(ContainSubstring("- hugepages=4"))
+		})
+
+		It("should add systemd unit to allocate hugepages", func() {
+			Expect(manifest).To(ContainSubstring(hugepagesAllocationService))
+		})
+
+		It("should add systemd unit to offlineCPUs", func() {
+			Expect(manifest).To(ContainSubstring(offlineCPUS))
+		})
+
+		// doesn't depend on hugepages or offlined CPUs
+		It("should create systemd unit for clearing banned CPUs", func() {
+			Expect(manifest).To(ContainSubstring(clearBannedCPUs))
+		})
+	})
+
+	Context("stalld backend configuration", func() {
+		It("should include stalld sysconfig and systemd dropin files", func() {
+			profile := testutils.NewPerformanceProfile("test")
+
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			Expect(json.Unmarshal(mc.Spec.Config.Raw, &result)).To(Succeed())
+
+			fileContents := map[string]string{}
+			for _, f := range result.Storage.Files {
+				Expect(f.Contents.Source).ToNot(BeNil(), "file %s has nil source", f.Path)
+				base64Data := strings.TrimPrefix(*f.Contents.Source, "data:text/plain;charset=utf-8;base64,")
+				decoded, err := base64.StdEncoding.DecodeString(base64Data)
+				Expect(err).ToNot(HaveOccurred())
+				fileContents[f.Path] = string(decoded)
+			}
+
+			Expect(fileContents).To(HaveKeyWithValue("/etc/sysconfig/stalld-backend", "BE=\"-b sched_debug\"\n"))
+			Expect(fileContents).To(HaveKeyWithValue("/etc/systemd/system/stalld.service.d/stalld-backend.conf", "[Service]\nEnvironmentFile=/etc/sysconfig/stalld-backend\n"))
+		})
+	})
+
+	Context("check listToString ", func() {
+		It("should create string from CPUSet", func() {
+			res := components.ListToString(CPUs)
+			Expect(res).To(Equal(CPUstring))
+		})
+	})
+
+	Context("check systemd units", func() {
+		It("should generate clear-banned-cpus unit", func() {
+			irqOpts, err := getIRQBalanceBannedCPUsOptions("")
+			Expect(err).ToNot(HaveOccurred())
+			unit, err := getSystemdContent(irqOpts)
+			Expect(err).ToNot(HaveOccurred())
+			expected := `[Unit]
+Description=Clear the IRQBalance Banned CPU mask early in the boot
+Before=kubelet.service
+Before=irqbalance.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/bin/clear-irqbalance-banned-cpus.sh
+
+[Install]
+WantedBy=multi-user.target
+`
+			Expect(unit).To(Equal(expected))
+		})
+	})
+})
+
+var _ = Describe("Pinning Config", func() {
+	type test struct {
+		desc        string
+		src         string
+		cpuSet      *performancev2.CPU
+		expected    string
+		expectedErr types.GomegaMatcher
+	}
+
+	var testCases []test
+	testCases = append(testCases, test{
+		desc: "pinned workloads infrastructure, should render pinned crio config",
+		src:  crioPartitioningConfig,
+		cpuSet: &performancev2.CPU{
+			Reserved: cpuSetRef("0-1"),
+			Isolated: cpuSetRef("2-3"),
+		},
+		expected: `
+			[crio.runtime.workloads.management]
+			activation_annotation = "target.workload.openshift.io/management"
+			annotation_prefix = "resources.workload.openshift.io"
+			resources = { "cpushares" = 0, "cpuset" = "0-1" }
+			`,
+	})
+	testCases = append(testCases, test{
+		desc: "pinned workloads infrastructure, should render openshift pinning config",
+		src:  ocpPartitioningConfig,
+		cpuSet: &performancev2.CPU{
+			Reserved: cpuSetRef("0-1"),
+			Isolated: cpuSetRef("2-3"),
+		},
+		expected: `
+			{
+				"management": {
+					"cpuset": "0-1"
+				}
+			}
+			`,
+	})
+	testCases = append(testCases, test{
+		desc:        "should fail when CPUSet is nil",
+		src:         ocpPartitioningConfig,
+		cpuSet:      nil,
+		expectedErr: Equal(errors.New("cpu value is required, skipping generating file")),
+	})
+
+	Describe("Pinning Config", func() {
+		for _, t := range testCases {
+			tc := t
+			When(tc.desc, func() {
+				It("should match expected", func() {
+					f, err := renderManagementCPUPinningConfig(tc.cpuSet, tc.src)
+					if tc.expectedErr == nil {
+						tc.expectedErr = BeNil()
+					}
+					Expect(err).Should(tc.expectedErr)
+
+					result := removeAllWhiteSpace(string(f))
+					expected := removeAllWhiteSpace(tc.expected)
+
+					Expect(result).To(Equal(expected))
+				})
+			})
+		}
+	})
+})
+
+var _ = Describe("Bootstrap Pinning Config", func() {
+
+	allNodes := configv1.CPUPartitioningAllNodes
+	none := configv1.CPUPartitioningNone
+	defaultEmptyCrio := []byte(`
+[crio.runtime.workloads.management]
+activation_annotation = "target.workload.openshift.io/management"
+annotation_prefix = "resources.workload.openshift.io"
+resources = { "cpushares" = 0, "cpuset" = "" }
+`)
+	defaultEmptyKubelet := []byte(`
+{
+  "management": {
+    "cpuset": ""
+  }
+}
+`)
+
+	expected := map[string][]byte{
+		"/etc/kubernetes/openshift-workload-pinning":             defaultEmptyKubelet,
+		"/etc/crio/crio.conf.d/01-workload-pinning-default.conf": defaultEmptyCrio,
+	}
+
+	Context("should generate config", func() {
+		It("when cpu partitioning set", func() {
+			mc, err := BootstrapWorkloadPinningMC("master", &allNodes)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mc).ToNot(BeNil())
+		})
+
+		It("with correct ignition configs", func() {
+			mc, err := BootstrapWorkloadPinningMC("master", &allNodes)
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Storage.Files).To(HaveLen(2))
+
+			for _, f := range result.Storage.Files {
+				nonEncodedContent, ok := expected[f.Path]
+				Expect(ok).To(BeTrue(), "path %s is not present in expected map", f.Path)
+				encoded := base64.StdEncoding.EncodeToString(nonEncodedContent)
+				Expect(f.Contents.Source).ToNot(BeNil())
+				Expect(*f.Contents.Source).To(
+					Equal(fmt.Sprintf("%s,%s", defaultIgnitionContentSource, encoded)),
+					"path %s contains content mismatch", f.Path)
+			}
+		})
+	})
+
+	Context("should not be generated", func() {
+		It("with cpu partitioning set to none", func() {
+			mc, err := BootstrapWorkloadPinningMC("master", &none)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mc).To(BeNil())
+		})
+
+		It("with nil being provided", func() {
+			mc, err := BootstrapWorkloadPinningMC("master", nil)
+			Expect(err).To(HaveOccurred())
+			Expect(mc).To(BeNil())
+		})
+	})
+})
+
+var _ = Describe("Machine Config OVS-DPDK CPUs", func() {
+	Context("ovs-dpdk-cpus-configure service and script", func() {
+		It("should create ovs-dpdk-cpus-configure service when ovs-dpdk cpus are specified", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{
+				OvsDpdkCPUs: "4-7",
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			found := false
+			for _, u := range result.Systemd.Units {
+				if u.Name == "ovs-dpdk-cpus-configure.service" {
+					found = true
+					Expect(u.Enabled).ToNot(BeNil())
+					Expect(*u.Enabled).To(BeTrue())
+				}
+			}
+			Expect(found).To(BeTrue(), "ovs-dpdk-cpus-configure.service should be present")
+		})
+
+		It("should create ovs-dpdk-cpus-configure script when ovs-dpdk cpus are specified", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{
+				OvsDpdkCPUs: "4-7",
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			found := false
+			for _, f := range result.Storage.Files {
+				if f.Path == "/usr/local/bin/ovs-dpdk-cpus-configure.sh" {
+					found = true
+					break
+				}
+			}
+			Expect(found).To(BeTrue(), "ovs-dpdk-cpus-configure.sh script should be present")
+		})
+
+		It("should not create ovs-dpdk-cpus-configure service when ovs-dpdk cpus are not specified", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, u := range result.Systemd.Units {
+				Expect(u.Name).ToNot(Equal("ovs-dpdk-cpus-configure.service"),
+					"ovs-dpdk-cpus-configure.service should not be present when no OVS-DPDK CPUs")
+			}
+		})
+	})
+
+	Context("ovs-vswitchd drop-in with ovs-dpdk cpus", func() {
+		It("should include OVS_DPDK_CPUS environment variable in ovs-vswitchd drop-in when OvsDpdkCPUs is set", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{
+				OvsDpdkCPUs: "4-7",
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			found := false
+			foundDelegate := false
+			for _, f := range result.Storage.Files {
+				if strings.Contains(f.Path, "ovs-vswitchd.service.d") {
+					base64Data := strings.TrimPrefix(*f.Contents.Source, "data:text/plain;charset=utf-8;base64,")
+					decoded, err := base64.StdEncoding.DecodeString(base64Data)
+					Expect(err).ToNot(HaveOccurred())
+					content := string(decoded)
+					if strings.Contains(content, "OVS_DPDK_CPUS=4-7") {
+						found = true
+					}
+					if strings.Contains(content, "Delegate=cpuset cpu pids") {
+						foundDelegate = true
+					}
+				}
+			}
+			Expect(found).To(BeTrue(), "ovs-vswitchd drop-in should contain Environment=OVS_DPDK_CPUS=4-7")
+			Expect(foundDelegate).To(BeTrue(), "ovs-vswitchd drop-in should contain Delegate=cpuset cpu pids")
+		})
+	})
+
+	Context("DisableLoadBalancingForOvsDpdk option", func() {
+		It("should still create OVS slice regardless of DisableLoadBalancingForOvsDpdk", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{
+				OvsDpdkCPUs:                    "4-7",
+				DisableLoadBalancingForOvsDpdk: true,
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			foundOvsSlice := false
+			for _, f := range result.Storage.Files {
+				if strings.Contains(f.Path, ovsSliceName) {
+					foundOvsSlice = true
+					break
+				}
+			}
+			Expect(foundOvsSlice).To(BeTrue(), "OVS slice definition should still be present")
+		})
+	})
+
+	Context("IRQBALANCE_BANNED_CPUS for ovs-dpdk cpus", func() {
+		It("should set IRQBALANCE_BANNED_CPUS when ovs-dpdk cpus are specified", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			ovsDpdkCPUs := performancev2.CPUSet("2-3")
+			profile.Spec.CPU.OvsDpdk = &ovsDpdkCPUs
+			mc, err := New(profile, &components.MachineConfigOptions{
+				OvsDpdkCPUs: "2-3",
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			found := false
+			for _, u := range result.Systemd.Units {
+				if u.Name == "clear-irqbalance-banned-cpus.service" && u.Contents != nil {
+					if strings.Contains(*u.Contents, "OVS_DPDK_CPUS=c") {
+						found = true
+					}
+				}
+			}
+			Expect(found).To(BeTrue(), "OVS_DPDK_CPUS should be set to hex mask of OVS-DPDK CPUs 2-3 (0xc)")
+		})
+
+		It("should not set IRQBALANCE_BANNED_CPUS when ovs-dpdk cpus are not specified", func() {
+			profile := testutils.NewPerformanceProfile("test")
+			mc, err := New(profile, &components.MachineConfigOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			result := igntypes.Config{}
+			err = json.Unmarshal(mc.Spec.Config.Raw, &result)
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, u := range result.Systemd.Units {
+				if u.Name == "clear-irqbalance-banned-cpus.service" && u.Contents != nil {
+					Expect(*u.Contents).ToNot(ContainSubstring("OVS_DPDK_CPUS"),
+						"IRQBALANCE_BANNED_CPUS should not be set when no OVS-DPDK CPUs")
+				}
+			}
+		})
+	})
+})
+
+func removeAllWhiteSpace(str string) string {
+	return spaceRegex.ReplaceAllString(str, "")
+}
+
+func cpuSetRef(set string) *performancev2.CPUSet {
+	re := performancev2.CPUSet(set)
+	return &re
+}

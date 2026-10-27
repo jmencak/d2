@@ -1,0 +1,560 @@
+package __latency
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	testutils "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils"
+	testclient "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/client"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/discovery"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/events"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/images"
+	testlog "github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/log"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/nodes"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/pods"
+	"github.com/openshift/cluster-node-tuning-operator/test/e2e/performanceprofile/functests/utils/profiles"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/cpuset"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	//tools names
+	oslatTestName       = "oslat"
+	cyclictestTestName  = "cyclictest"
+	hwlatdetectTestName = "hwlatdetect"
+
+	//default values
+	defaultTestDelay         = 0
+	defaultTestRuntime       = "300"
+	defaultMaxLatency        = -1
+	defaultTestCpus          = -1
+	defaultTestMemory        = "1Gi"
+	defaultTestTimeoutBuffer = 150
+	//dynamic memory mode values
+	// 32Mi per requested CPU should be reasonable for the test
+	perCpuMemoryFactor = 32
+	memoryFactorFormat = "Mi"
+
+	minCpuAmountForOslat = 2
+)
+
+var (
+	latencyTestDelay         = defaultTestDelay
+	latencyTestRuntime       = defaultTestRuntime
+	latencyTestTimeoutBuffer = defaultTestTimeoutBuffer
+	maximumLatency           = defaultMaxLatency
+	latencyTestCpus          = defaultTestCpus
+	latencyTestMemory        = defaultTestMemory
+)
+
+// LATENCY_TEST_DELAY delay the run of the binary, can be useful to give time to the CPU manager reconcile loop
+// to update the default CPU pool
+// LATENCY_TEST_TIMEOUT_BUFFER: extra seconds for pod CPU setup and Succeeded wait (not per-tool runtime)
+// LATENCY_TEST_RUNTIME: the amount of time in seconds that the latency test should run
+// LATENCY_TEST_CPUS: the amount of CPUs the pod which run the latency test should request
+// LATENCY_TEST_MEMORY: the amount of memory the pod which run the latency test should request
+var _ = Describe("[performance] Latency Test", Ordered, func() {
+	var workerRTNode *corev1.Node
+	var profile *performancev2.PerformanceProfile
+	var latencyTestPod *corev1.Pod
+	var err error
+
+	BeforeEach(func() {
+		latencyTestDelay, err = getLatencyTestDelay()
+		Expect(err).ToNot(HaveOccurred())
+
+		latencyTestTimeoutBuffer, err = getLatencyTestTimeoutBuffer()
+		Expect(err).ToNot(HaveOccurred())
+
+		latencyTestCpus, err = getLatencyTestCpus()
+		Expect(err).ToNot(HaveOccurred())
+
+		latencyTestRuntime, err = getLatencyTestRuntime()
+		Expect(err).ToNot(HaveOccurred())
+
+		if discovery.Enabled() && testutils.ProfileNotFound {
+			Skip("Discovery mode enabled, performance profile not found")
+		}
+
+		profile, err = profiles.GetByNodeLabels(testutils.NodeSelectorLabels)
+		Expect(err).ToNot(HaveOccurred())
+
+		if isOddCpuNumber(latencyTestCpus, profile) {
+			Skip("Skip the test, the requested number of CPUs should be even to avoid noisy neighbor situation")
+		}
+
+		workerRTNodes, err := nodes.GetByLabels(testutils.NodeSelectorLabels)
+		Expect(err).ToNot(HaveOccurred())
+
+		workerRTNodes, err = nodes.MatchingOptionalSelector(workerRTNodes)
+		Expect(err).ToNot(HaveOccurred(), "error looking for the optional selector: %v", err)
+
+		Expect(workerRTNodes).ToNot(BeEmpty())
+
+		//At least one worker node should have cpu.Allocatable greater than the quantity requested by each test, else skip the test
+		workerRTNodesWithSufficientCpu := nodes.GetByCpuAllocatable(workerRTNodes, latencyTestCpus)
+		if len(workerRTNodesWithSufficientCpu) == 0 {
+			Skip("Insufficient cpu to run the test")
+
+		}
+		workerRTNode = &workerRTNodesWithSufficientCpu[0]
+
+	})
+
+	AfterEach(func() {
+		if latencyTestPod != nil {
+			Expect(pods.DeleteAndSync(context.TODO(), testclient.DataPlaneClient, latencyTestPod)).To(Succeed())
+		}
+
+		maximumLatency = -1
+	})
+
+	Context("with the oslat image", func() {
+		testName := oslatTestName
+
+		BeforeEach(func() {
+			maximumLatency, err = getMaximumLatency(testName)
+			Expect(err).ToNot(HaveOccurred())
+
+			if profile.Spec.CPU.Isolated == nil {
+				Skip(fmt.Sprintf("Skip the oslat test, the profile %q does not have isolated CPUs", profile.Name))
+			}
+
+			isolatedCpus, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+			Expect(err).ToNot(HaveOccurred(), "failed to parse cpus %q", string(*profile.Spec.CPU.Isolated))
+			// we require at least two CPUs to run oslat test, because one CPU should be used to run the main oslat thread
+			// we can not use all isolated CPUs, because if reserved and isolated include all node CPUs, and reserved CPUs
+			// do not calculated into the Allocated, at least part of time of one of isolated CPUs will be used to run
+			// other node containers
+			// at least two isolated CPUs to run oslat + one isolated CPU used by other containers on the node = at least 3 isolated CPUs
+			if isolatedCpus.Size() < (minCpuAmountForOslat + 1) {
+				Skip(fmt.Sprintf("Skip the oslat test, the profile %q has less than %d isolated CPUs", profile.Name, minCpuAmountForOslat))
+			}
+			if latencyTestCpus < minCpuAmountForOslat && latencyTestCpus != defaultTestCpus {
+				Skip(fmt.Sprintf("Skip the oslat test, LATENCY_TEST_CPUS is less than the minimum CPUs amount %d", minCpuAmountForOslat))
+			}
+		})
+
+		It("should succeed", func() {
+			defer func() {
+				logs, err := pods.GetLogs(testclient.K8sClient, latencyTestPod)
+				Expect(err).ToNot(HaveOccurred())
+				testlog.Infof(logs)
+			}()
+			oslatArgs := []string{
+				fmt.Sprintf("-runtime=%s", latencyTestRuntime),
+			}
+			latencyTestPod = getLatencyTestPod(profile, workerRTNode, testName, oslatArgs)
+			createLatencyTestPod(latencyTestPod)
+
+			// verify the maximum latency only when it requested, because this value can be very different
+			// on different systems
+			if maximumLatency == -1 {
+				Skip("no maximum latency value provided, skip buckets latency check")
+			}
+			latencies := extractLatencyValues(`Maximum:\t*([\s\d]*)\(us\)`, latencyTestPod)
+			maxLatencyMeasured := slices.Max(latencies)
+			Expect(maxLatencyMeasured < maximumLatency).To(BeTrue(), "The maximum latency measured %d is bigger than the expected one %d", maxLatencyMeasured, maximumLatency)
+		})
+	})
+
+	Context("with the cyclictest image", func() {
+		testName := cyclictestTestName
+
+		BeforeEach(func() {
+			maximumLatency, err = getMaximumLatency(testName)
+			Expect(err).ToNot(HaveOccurred())
+
+			if profile.Spec.CPU.Isolated == nil {
+				Skip(fmt.Sprintf("Skip the cyclictest test, the profile %q does not have isolated CPUs", profile.Name))
+			}
+		})
+
+		It("should succeed", func() {
+			defer func() {
+				logs, err := pods.GetLogs(testclient.K8sClient, latencyTestPod)
+				Expect(err).ToNot(HaveOccurred())
+				testlog.Infof(logs)
+			}()
+			cyclictestArgs := []string{
+				fmt.Sprintf("-duration=%s", latencyTestRuntime),
+			}
+			latencyTestPod = getLatencyTestPod(profile, workerRTNode, testName, cyclictestArgs)
+			createLatencyTestPod(latencyTestPod)
+
+			// verify the maximum latency only when it requested, because this value can be very different
+			// on different systems
+			if maximumLatency == -1 {
+				Skip("no maximum latency value provided, skip buckets latency check")
+			}
+			latencies := extractLatencyValues(`# Max Latencies:\t*\s*(.*)\s*\t*`, latencyTestPod)
+			maxLatencyMeasured := slices.Max(latencies)
+			Expect(maxLatencyMeasured < maximumLatency).To(BeTrue(), "The maximum latency measured %d is bigger than the expected one %d", maxLatencyMeasured, maximumLatency)
+
+		})
+	})
+
+	Context("with the hwlatdetect image", func() {
+		testName := hwlatdetectTestName
+
+		BeforeEach(func() {
+			maximumLatency, err = getMaximumLatency(testName)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should succeed", func() {
+			defer func() {
+				logs, err := pods.GetLogs(testclient.K8sClient, latencyTestPod)
+				Expect(err).ToNot(HaveOccurred())
+				testlog.Infof(logs)
+			}()
+			hardLimit := maximumLatency
+			if hardLimit == -1 {
+				// This value should be > than max latency,
+				// in order to prevent the hwlatdetect return with error 1 in case latency value is bigger than expected.
+				// in case latency value is bigger than expected, it will be handled on different flow.
+				hardLimit = 1000
+			}
+
+			hwlatdetectArgs := []string{
+				fmt.Sprintf("-hardlimit=%d", hardLimit),
+				fmt.Sprintf("-duration=%s", latencyTestRuntime),
+			}
+
+			// set the maximum latency for the test if needed
+			if maximumLatency != -1 {
+				hwlatdetectArgs = append(hwlatdetectArgs, fmt.Sprintf("-threshold=%d", maximumLatency))
+			}
+
+			latencyTestPod = getLatencyTestPod(profile, workerRTNode, testName, hwlatdetectArgs)
+			createLatencyTestPod(latencyTestPod)
+			// here we don't need to parse the latency values.
+			// hwlatdetect will do that for us and exit with error if needed.
+		})
+	})
+})
+
+func getLatencyTestRuntime() (string, error) {
+	if latencyTestRuntimeEnv, ok := os.LookupEnv("LATENCY_TEST_RUNTIME"); ok {
+		val, err := strconv.Atoi(latencyTestRuntimeEnv)
+		if err != nil {
+			return latencyTestRuntimeEnv, fmt.Errorf("the environment variable LATENCY_TEST_RUNTIME has incorrect value %q, it must be a positive integer with maximum value of %d", latencyTestRuntimeEnv, math.MaxInt32)
+		}
+		if val < 1 || val > math.MaxInt32 {
+			return "", fmt.Errorf("the environment variable LATENCY_TEST_RUNTIME has an invalid number %q, it must be a positive integer with maximum value of %d", latencyTestRuntimeEnv, math.MaxInt32)
+		}
+		return latencyTestRuntimeEnv, nil
+	}
+	return defaultTestRuntime, nil
+}
+
+func getLatencyTestDelay() (int, error) {
+	if latencyTestDelayEnv, ok := os.LookupEnv("LATENCY_TEST_DELAY"); ok {
+		val, err := strconv.Atoi(latencyTestDelayEnv)
+		if err != nil {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_DELAY has incorrect value %q, it must be a non-negative integer with maximum value of %d: %w", latencyTestDelayEnv, math.MaxInt32, err)
+		}
+		if val < 0 || val > math.MaxInt32 {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_DELAY has an invalid number %q, it must be a non-negative integer with maximum value of %d", latencyTestDelayEnv, math.MaxInt32)
+		}
+		return val, nil
+	}
+	return defaultTestDelay, nil
+}
+
+func getLatencyTestTimeoutBuffer() (int, error) {
+	if latencyTestTimeoutBufferEnv, ok := os.LookupEnv("LATENCY_TEST_TIMEOUT_BUFFER"); ok {
+		val, err := strconv.Atoi(latencyTestTimeoutBufferEnv)
+		if err != nil {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_TIMEOUT_BUFFER has incorrect value %q, it must be a non-negative integer with maximum value of %d: %w", latencyTestTimeoutBufferEnv, math.MaxInt32, err)
+		}
+		if val < 0 || val > math.MaxInt32 {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_TIMEOUT_BUFFER has an invalid number %q, it must be a non-negative integer with maximum value of %d", latencyTestTimeoutBufferEnv, math.MaxInt32)
+		}
+		if val < defaultTestTimeoutBuffer {
+			testlog.Warningf("LATENCY_TEST_TIMEOUT_BUFFER=%d is below %d; for safe execution set it to %d or higher, as a lower value may cause timeouts", val, defaultTestTimeoutBuffer, defaultTestTimeoutBuffer)
+		}
+		return val, nil
+	}
+	return defaultTestTimeoutBuffer, nil
+}
+
+func getLatencyTestCpus() (int, error) {
+	if latencyTestCpusEnv, ok := os.LookupEnv("LATENCY_TEST_CPUS"); ok {
+		val, err := strconv.Atoi(latencyTestCpusEnv)
+		if err != nil {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_CPUS has incorrect value %q, it must be a positive integer with maximum value of %d: %w", latencyTestCpusEnv, math.MaxInt32, err)
+		}
+		if val <= 0 || val > math.MaxInt32 {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_CPUS has an invalid number %q, it must be a positive integer with maximum value of %d", latencyTestCpusEnv, math.MaxInt32)
+		}
+		return val, nil
+	}
+	return defaultTestCpus, nil
+}
+
+// getLatencyTestMemory returns the memory limit for the latency test pod based on
+// LATENCY_TEST_MEMORY and the CPU count.If LATENCY_TEST_MEMORY is unset, it returns
+// it returns an auto-scaled memory based on perCpuMemoryFactor per CPU. If explicitly
+// set to a valid value, it returns the value and ignores the CPU count. Otherwise,
+// it returns an error on invalid inputs
+func getLatencyTestMemory(cpus int) (string, error) {
+	if val, ok := os.LookupEnv("LATENCY_TEST_MEMORY"); ok {
+		q, err := resource.ParseQuantity(val)
+		if err != nil {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_MEMORY has incorrect value %q, it must be a valid quantity: %w", val, err)
+		}
+		if q.Sign() <= 0 {
+			return val, fmt.Errorf("the environment variable LATENCY_TEST_MEMORY has invalid value %q, it must be greater than 0", val)
+		}
+		return val, nil
+	}
+
+	// Defensive check: fall back to default memory if the CPU count was not normalized
+	if cpus == defaultTestCpus || cpus < 1 {
+		return defaultTestMemory, nil
+	}
+
+	defaultQuantity, err := resource.ParseQuantity(defaultTestMemory)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse default quantity %q: %w", defaultTestMemory, err)
+	}
+
+	computedInt := perCpuMemoryFactor * cpus
+	computedQuantity, err := resource.ParseQuantity(fmt.Sprintf("%d%s", computedInt, memoryFactorFormat))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse computed quantity %q: %w", fmt.Sprintf("%d%s", computedInt, memoryFactorFormat), err)
+	}
+
+	if computedQuantity.Cmp(defaultQuantity) > 0 {
+		return computedQuantity.String(), nil
+	}
+
+	// floor at default for backward compatibility
+	return defaultTestMemory, nil
+}
+
+// getMaximumLatency should look for one of the following environment variables:
+// OSLAT_MAXIMUM_LATENCY: the expected maximum latency for all buckets in us
+// CYCLICTEST_MAXIMUM_LATENCY: the expected maximum latency for all buckets in us
+// HWLATDETECT_MAXIMUM_LATENCY: the expected maximum latency for all buckets in us
+// MAXIMUM_LATENCY: unified expected maximum latency for all tests
+func getMaximumLatency(testName string) (int, error) {
+	var err error
+	val := defaultMaxLatency
+	if unifiedMaxLatencyEnv, ok := os.LookupEnv("MAXIMUM_LATENCY"); ok {
+		val, err = strconv.Atoi(unifiedMaxLatencyEnv)
+		if err != nil {
+			return val, fmt.Errorf("the environment variable MAXIMUM_LATENCY has incorrect value %q, it must be a non-negative integer with maximum value of %d: %w", unifiedMaxLatencyEnv, math.MaxInt32, err)
+		}
+		if val < 0 || val > math.MaxInt32 {
+			return val, fmt.Errorf("the environment variable MAXIMUM_LATENCY has an invalid number %q, it must be a non-negative integer with maximum value of %d", unifiedMaxLatencyEnv, math.MaxInt32)
+		}
+	}
+
+	// specific values will have precedence over the general one
+	envVariableName := fmt.Sprintf("%s_MAXIMUM_LATENCY", strings.ToUpper(testName))
+	if maximumLatencyEnv, ok := os.LookupEnv(envVariableName); ok {
+		val, err = strconv.Atoi(maximumLatencyEnv)
+		if err != nil {
+			err = fmt.Errorf("the environment variable %q has incorrect value %q, it must be a non-negative integer with maximum value of %d: %w", envVariableName, maximumLatencyEnv, math.MaxInt32, err)
+		}
+		if val < 0 || val > math.MaxInt32 {
+			err = fmt.Errorf("the environment variable %q has an invalid number %q, it must be a non-negative integer with maximum value of %d", envVariableName, maximumLatencyEnv, math.MaxInt32)
+		}
+	}
+	return val, err
+}
+
+func getLatencyTestPod(profile *performancev2.PerformanceProfile, node *corev1.Node, testName string, testSpecificArgs []string) *corev1.Pod {
+	runtimeClass := components.GetComponentName(profile.Name, components.ComponentNamePrefix)
+	testNamePrefix := fmt.Sprintf("%s-", testName)
+	runnerName := fmt.Sprintf("%srunner", testNamePrefix)
+	runnerPath := path.Join("usr", "bin", runnerName)
+
+	if latencyTestCpus == defaultTestCpus {
+		// we can not use all isolated CPUs, because if reserved and isolated include all node CPUs, and reserved CPUs
+		// do not calculated into the Allocated, at least part of time of one of isolated CPUs will be used to run
+		// other node containers
+		cpus, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+		Expect(err).ToNot(HaveOccurred(), "failed to parse cpus %q", string(*profile.Spec.CPU.Isolated))
+		latencyTestCpus = cpus.Size() - 1
+	}
+
+	var err error
+	latencyTestMemory, err = getLatencyTestMemory(latencyTestCpus)
+	Expect(err).ToNot(HaveOccurred(), "failed to compute latency pod's memory: %v", err)
+
+	latencyTestRunnerArgs := []string{
+		"-logtostderr=false",
+		"-alsologtostderr=true",
+	}
+
+	latencyTestRunnerArgs = append(latencyTestRunnerArgs, testSpecificArgs...)
+
+	if latencyTestDelay > 0 {
+		latencyTestRunnerArgs = append(latencyTestRunnerArgs, fmt.Sprintf("-%s-start-delay=%d", testName, latencyTestDelay))
+	}
+
+	volumeTypeDirectory := corev1.HostPathDirectory
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: testNamePrefix,
+			Annotations: map[string]string{
+				"irq-load-balancing.crio.io": "disable",
+				"cpu-load-balancing.crio.io": "disable",
+				"cpu-quota.crio.io":          "disable",
+			},
+			Namespace: testutils.NamespaceTesting,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:    corev1.RestartPolicyNever,
+			RuntimeClassName: &runtimeClass,
+			Containers: []corev1.Container{
+				{
+					Name:  runnerName,
+					Image: images.Test(),
+					Command: []string{
+						runnerPath,
+					},
+					Args: latencyTestRunnerArgs,
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(strconv.Itoa(latencyTestCpus)),
+							corev1.ResourceMemory: resource.MustParse(latencyTestMemory),
+						},
+					},
+					SecurityContext: &corev1.SecurityContext{
+						Privileged: ptr.To(true),
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "logs",
+							MountPath: "/host",
+						},
+					},
+				},
+			},
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": node.Labels["kubernetes.io/hostname"],
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "logs",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/var/log",
+							Type: &volumeTypeDirectory,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func logEventsForPod(testPod *corev1.Pod) {
+	events, err := events.GetEventsForObject(testclient.Client, testPod.Namespace, testPod.Name, string(testPod.UID))
+	if err != nil {
+		testlog.Error(err)
+	}
+	testlog.Infof("log pod %s/%s events due to failure", testPod.Namespace, testPod.Name)
+	for _, event := range events.Items {
+		testlog.Warningf("-> %s %s %s", event.Action, event.Reason, event.Message)
+	}
+}
+
+func createLatencyTestPod(testPod *corev1.Pod) {
+	err := testclient.Client.Create(context.TODO(), testPod)
+	Expect(err).ToNot(HaveOccurred())
+
+	timeout, err := strconv.Atoi(latencyTestRuntime)
+	Expect(err).ToNot(HaveOccurred())
+
+	By("Waiting two minutes to download the latencyTest image")
+	podKey := fmt.Sprintf("%s/%s", testPod.Namespace, testPod.Name)
+	currentPod, err := pods.WaitForPredicate(context.TODO(), client.ObjectKeyFromObject(testPod), 2*time.Minute, func(pod *corev1.Pod) (bool, error) {
+		if pod.Status.Phase == corev1.PodRunning {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		logEventsForPod(testPod)
+	}
+	Expect(err).ToNot(HaveOccurred(), "pod %q did not reach %q phase; current phase %q", podKey, corev1.PodRunning, currentPod.Status.Phase)
+
+	if runtime, _ := strconv.Atoi(latencyTestRuntime); runtime > 1 {
+		By("Checking actual CPUs number for the running pod")
+		limitsCpusQuantity := testPod.Spec.Containers[0].Resources.Limits.Cpu()
+		RequestsCpusQuantity := testPod.Spec.Containers[0].Resources.Requests.Cpu()
+		//latency pod is guaranteed
+		Expect(isEqual(limitsCpusQuantity, latencyTestCpus)).To(BeTrue(), fmt.Sprintf("actual limits of cpus number used for the latency pod is not as set in LATENCY_TEST_CPUS, actual number is: %s", limitsCpusQuantity))
+		Expect(isEqual(RequestsCpusQuantity, latencyTestCpus)).To(BeTrue(), fmt.Sprintf("actual requests of cpus number used for the latency pod is not as set in LATENCY_TEST_CPUS, actual number is: %s", RequestsCpusQuantity))
+	}
+
+	podTimeout := time.Duration(timeout + latencyTestDelay + latencyTestTimeoutBuffer)
+	By(fmt.Sprintf("Waiting up to %d seconds (runtime=%d, delay=%d, timeoutBuffer=%d) for the pod to reach Succeeded phase", int(podTimeout), timeout, latencyTestDelay, latencyTestTimeoutBuffer))
+
+	testPod, err = pods.WaitForPhase(context.TODO(), client.ObjectKeyFromObject(testPod), corev1.PodSucceeded, podTimeout*time.Second)
+	if err != nil {
+		logEventsForPod(testPod)
+	}
+	Expect(err).ToNot(HaveOccurred(), "pod %q did not reach %q phase; error: %v. Please Increase LATENCY_TEST_TIMEOUT_BUFFER to allow the cluster to move the pod to Succeeded phase and run again.", podKey, corev1.PodSucceeded, err)
+}
+
+func extractLatencyValues(exp string, pod *corev1.Pod) []int {
+	GinkgoHelper()
+
+	out, err := pods.GetLogs(testclient.K8sClient, pod)
+	Expect(err).ToNot(HaveOccurred())
+
+	maximumRegex, err := regexp.Compile(exp)
+	Expect(err).ToNot(HaveOccurred())
+
+	output := maximumRegex.FindStringSubmatch(out)
+	Expect(len(output)).To(Equal(2))
+
+	var latencies []int
+	for _, lat := range strings.Split(output[1], " ") {
+		if lat == "" {
+			continue
+		}
+		curr, err := strconv.Atoi(lat)
+		Expect(err).ToNot(HaveOccurred())
+		latencies = append(latencies, curr)
+	}
+	return latencies
+}
+
+func isEqual(qty *resource.Quantity, amount int) bool {
+	return qty.CmpInt64(int64(amount)) == 0
+}
+
+func isOddCpuNumber(cpusNum int, profile *performancev2.PerformanceProfile) bool {
+	if cpusNum == defaultTestCpus {
+		isolatedCpus, err := cpuset.Parse(string(*profile.Spec.CPU.Isolated))
+		Expect(err).ToNot(HaveOccurred(), "failed to parse cpus %q", string(*profile.Spec.CPU.Isolated))
+		isolatedCpusNum := isolatedCpus.Size() - 1
+		return isolatedCpusNum%2 != 0
+	}
+	return cpusNum%2 != 0
+}

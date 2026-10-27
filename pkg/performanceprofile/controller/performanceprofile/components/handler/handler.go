@@ -1,0 +1,198 @@
+package handler
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	k8serros "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	performancev2 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/performanceprofile/v2"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components/machineconfig"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components/manifestset"
+	profileutil "github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/components/profile"
+	"github.com/openshift/cluster-node-tuning-operator/pkg/performanceprofile/controller/performanceprofile/resources"
+	ntosync "github.com/openshift/cluster-node-tuning-operator/pkg/sync"
+)
+
+var _ components.Handler = &handler{}
+
+type handler struct {
+	client.Client
+	scheme *runtime.Scheme
+}
+
+func NewHandler(cli client.Client, scheme *runtime.Scheme) components.Handler {
+	return &handler{Client: cli, scheme: scheme}
+}
+
+func (h *handler) Apply(ctx context.Context, obj client.Object, recorder record.EventRecorder, opts *components.Options) error {
+	profile, ok := obj.(*performancev2.PerformanceProfile)
+	if !ok {
+		return fmt.Errorf("wrong type conversion; want=*PerformanceProfile got=%T", obj)
+	}
+
+	if profileutil.IsPaused(profile) {
+		// this is expected to be exceptional, hence we omit V()
+		klog.Infof("Ignoring reconcile loop for pause performance profile %s", profile.Name)
+		return nil
+	}
+
+	profileutil.SetMissingOptions(profile, opts)
+
+	components, err := manifestset.GetNewComponents(profile, opts)
+	if err != nil {
+		return err
+	}
+
+	if err := profileutil.ValidateOvsDpdkCPUsPrerequisites(profile, opts, components.KubeletConfig); err != nil {
+		return err
+	}
+
+	for _, componentObj := range components.ToObjects() {
+		if err := controllerutil.SetControllerReference(profile, componentObj, h.scheme); err != nil {
+			return err
+		}
+	}
+
+	// get mutated machine config
+	mcMutated, err := resources.GetMutatedMachineConfig(ctx, h.Client, components.MachineConfig)
+	if err != nil {
+		return err
+	}
+
+	// get mutated kubelet config
+	kcMutated, err := resources.GetMutatedKubeletConfig(ctx, h.Client, components.KubeletConfig)
+	if err != nil {
+		return err
+	}
+
+	// get mutated performance tuned
+	performanceTuned, performanceTunedNeedsUpdate, err := resources.GetMutatedTuned(ctx, h.Client, components.Tuned)
+	if err != nil {
+		return err
+	}
+
+	// get mutated RuntimeClass
+	runtimeClassMutated, err := resources.GetMutatedRuntimeClass(ctx, h.Client, components.RuntimeClass)
+	if err != nil {
+		return err
+	}
+
+	updated := mcMutated != nil ||
+		kcMutated != nil ||
+		performanceTunedNeedsUpdate ||
+		runtimeClassMutated != nil
+
+	// does not update any resources if it no changes to relevant objects and continue to the status update
+	if !updated {
+		return nil
+	}
+
+	if opts.ProfileMCP == nil {
+		// This can happen when MCP validation fails.
+		return fmt.Errorf("no valid PerformanceProfile's MCP")
+	}
+
+	// Create/update Tuned first, TuneD pods need this to calculate bootcmdline and agree on it.
+	if performanceTunedNeedsUpdate {
+		ntosync.GetBootcmdlineSync().ClearCacheForPool(opts.ProfileMCP.Name) // Do not honor a stale ready signal from a previous generation
+		if err := resources.CreateOrUpdateTuned(ctx, h.Client, performanceTuned, profile.Name); err != nil {
+			return err
+		}
+		klog.Infof("PerformanceProfile %q: created/updated Tuned CR %q for MCP %q", profile.Name, performanceTuned.Name, opts.ProfileMCP.Name)
+	}
+
+	// Check bootcmdline sync signal from the operator controller before creating MachineConfig.
+	// This synchronizes the creation of the PerformanceProfile's MachineConfig (50-performance-*)
+	// with the operator's MachineConfig (50-nto-*) to prevent multiple reboots.
+	// The check is generation-aware.  It verifies that the bootcmdline was calculated with the
+	// current performance Tuned CR identified by its name:generation.  The check is non-blocking.
+	// If not ready, we return an error to requeue.  The operator controller will also trigger
+	// immediate reconciliation when ready.
+	mcpName := opts.ProfileMCP.Name
+	bootcmdlineSync := ntosync.GetBootcmdlineSync()
+
+	// Check if the current performance Tuned CR is included in the bootcmdline calculation.
+	// We use the performanceTuned object which always contains the existing CR (with Generation field)
+	// whether or not it needs updating.
+	expectedTunedDep := fmt.Sprintf("%s:%d", performanceTuned.Name, performanceTuned.Generation)
+
+	if !bootcmdlineSync.IsReady(mcpName, expectedTunedDep) {
+		klog.Infof("PerformanceProfile %q [%v]: bootcmdline not ready for MCP %q", profile.Name, expectedTunedDep, mcpName)
+		return &ntosync.BootcmdlineNotReadyError{
+			PoolName: mcpName,
+			Message:  fmt.Sprintf("waiting for bootcmdline to be ready for MCP %q with Tuned dependency %q", mcpName, expectedTunedDep),
+		}
+	}
+
+	if mcMutated != nil {
+		if err := resources.CreateOrUpdateMachineConfig(ctx, h.Client, mcMutated); err != nil {
+			return err
+		}
+	}
+
+	if kcMutated != nil {
+		if err := resources.CreateOrUpdateKubeletConfig(ctx, h.Client, kcMutated); err != nil {
+			return err
+		}
+	}
+
+	if runtimeClassMutated != nil {
+		if err := resources.CreateOrUpdateRuntimeClass(ctx, h.Client, runtimeClassMutated); err != nil {
+			return err
+		}
+	}
+	recorder.Eventf(profile, corev1.EventTypeNormal, "Creation succeeded", "Succeeded to create all components")
+	return nil
+}
+
+func (h *handler) Delete(ctx context.Context, profileName string) error {
+	tunedName := components.GetComponentName(profileName, components.ProfileNamePerformance)
+	if err := resources.DeleteTuned(ctx, h.Client, tunedName, components.NamespaceNodeTuningOperator); err != nil {
+		return err
+	}
+
+	name := components.GetComponentName(profileName, components.ComponentNamePrefix)
+	if err := resources.DeleteKubeletConfig(ctx, h.Client, name); err != nil {
+		return err
+	}
+	if err := resources.DeleteRuntimeClass(ctx, h.Client, name); err != nil {
+		return err
+	}
+	if err := resources.DeleteMachineConfig(ctx, h.Client, machineconfig.GetMachineConfigName(profileName)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *handler) Exists(ctx context.Context, profileName string) bool {
+	tunedName := components.GetComponentName(profileName, components.ProfileNamePerformance)
+	if _, err := resources.GetTuned(ctx, h.Client, tunedName, components.NamespaceNodeTuningOperator); !k8serros.IsNotFound(err) {
+		klog.V(1).Infof("Tuned %q custom resource is still exists in the namespace %q", tunedName, components.NamespaceNodeTuningOperator)
+		return true
+	}
+
+	name := components.GetComponentName(profileName, components.ComponentNamePrefix)
+	if _, err := resources.GetKubeletConfig(ctx, h.Client, name); !k8serros.IsNotFound(err) {
+		klog.V(1).Infof("Kubelet Config %q exists in the cluster", name)
+		return true
+	}
+
+	if _, err := resources.GetRuntimeClass(ctx, h.Client, name); !k8serros.IsNotFound(err) {
+		klog.V(1).Infof("Runtime class %q exists in the cluster", name)
+		return true
+	}
+
+	if _, err := resources.GetMachineConfig(ctx, h.Client, machineconfig.GetMachineConfigName(profileName)); !k8serros.IsNotFound(err) {
+		klog.V(1).Infof("Machine Config %q exists in the cluster", name)
+		return true
+	}
+	return false
+}

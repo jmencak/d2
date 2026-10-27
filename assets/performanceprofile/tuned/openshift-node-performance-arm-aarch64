@@ -1,0 +1,7 @@
+[main]
+summary=Platform specific tuning for aarch64
+
+[bootloader]
+# No cstate for ARM
+# No pstate args for ARM
+
